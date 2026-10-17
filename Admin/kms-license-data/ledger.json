@@ -1,0 +1,28 @@
+{
+  "VERSION": "kms-license 1.1",
+  "licenses": [
+    {
+      "serial": "KMS-2026-0001",
+      "customer": "Customer name",
+      "organization": "Outline",
+      "adminEmail": "admin@kms.imamreza.ir",
+      "installId": "d356ae2c95fcdfbce2c2facd157352fc",
+      "serverKey": "28ea8136acf551c2cdbfb94afe234766111922af1e3886dbbd730cef7f49db15",
+      "serverBoxKey": "7j4fA5aZhH8qrRW4fh-IxAIVZG9hp_In1tlhA9NQXkg",
+      "hw": {
+        "machine": "2f33cc8b2e8fd4ee1f7a685da4518f9ecc05254c5fba0021a17c78d14286768c",
+        "machineid": "9bf29edd33c291a7ef53ead8ba35fd9c82739bfae51b27ffb8af9bbe4b84626b",
+        "disk": "dfccbaa88b9ac16c6f30f63714fc2ba0af5f17dec58eda8a3b280162ba07f845",
+        "mac": "6f2c179134a2754be6778ce61db010693acd0d5be37cd7a82d6ea2fc0fd246c7"
+      },
+      "issuedAt": "2026-10-12T09:50:22.962Z",
+      "notBefore": "2026-10-12T09:45:22.962Z",
+      "expiresAt": "2028-03-19T20:29:59.000Z",
+      "warnDays": 30,
+      "note": "",
+      "renewalOf": "",
+      "licenseFile": "issued/KMS-2026-0001.kmslic",
+      "requestFile": "requests/KMS-2026-0001.kmsreq"
+    }
+  ]
+}

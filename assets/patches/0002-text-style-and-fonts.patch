@@ -1,0 +1,829 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 02/18] feat(editor): font, size and color; bundled Persian web fonts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001)
+
+Font, font size and text color (was 0004 v1.0):
+- New text_style mark with optional fontFamily, fontSize and color, written
+  as an inline style built only from whitelisted values (no arbitrary CSS).
+- Formatting toolbar: Font, Font size and Text color submenus.
+- The Font button shows the font of the selected text. Font names are
+  localized from public/fonts/names.json (e.g. Vazirmatn in Persian); a
+  font without a name for the language keeps its own name.
+- Font and size follow the interface direction.
+- Fonts not bundled with the app (Tahoma, Arial, Times New Roman, Georgia,
+  Courier New) are kept as legacy values so existing text still renders,
+  but are not offered in the menu.
+- Pasted styles are kept only when they match a menu value (no fixed black
+  text from word processors in the dark theme); spans written by the editor
+  keep every value. Not exported to Markdown (no syntax).
+
+Bundled Persian web fonts (was 0005 v1.0):
+- @font-face rules for Vazirmatn (variable), Sahel, Shabnam, Samim and
+  Parastoo, one rule per real weight file (no synthesized bold).
+- The .woff2 files (SIL OFL) are not part of the patch: install.sh (step 4)
+  unzips them from assets/fonts.zip into public/fonts/.
+
+Files (10; N = new, M = modified, D = deleted):
+  N app/components/Icons/TextStyleIcon.tsx
+  M app/editor/menus/formatting.tsx
+  N app/utils/fontNames.ts
+  N public/fonts/names.json
+  M server/static/index.html
+  N shared/editor/marks/TextStyle.ts
+  M shared/editor/nodes/index.ts
+  N shared/editor/queries/getTextStyle.ts
+  N shared/utils/textStyle.test.ts
+  N shared/utils/textStyle.ts
+
+---
+---
+
+diff --git a/app/components/Icons/TextStyleIcon.tsx b/app/components/Icons/TextStyleIcon.tsx
+new file mode 100644
+index 0000000..fbd9bd4
+--- /dev/null
++++ b/app/components/Icons/TextStyleIcon.tsx
+@@ -0,0 +1,51 @@
++type Props = {
++  /** Which control the icon stands for. */
++  kind: "size" | "color";
++  /** For "size", the size to show; for "color", the color of the bar. */
++  value?: string | number | null;
++  size?: number;
++};
++
++/**
++ * Icons for the font size and text color controls. The size icon shows
++ * the current size, and the color icon a bar in the current color.
++ */
++export default function TextStyleIcon({ kind, value, size = 24 }: Props) {
++  return (
++    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden>
++      {kind === "color" ? (
++        <>
++          <text
++            x="12"
++            y="16"
++            textAnchor="middle"
++            fontSize="15"
++            fontWeight="700"
++            fill="currentColor"
++          >
++            A
++          </text>
++          <rect
++            x="4"
++            y="19"
++            width="16"
++            height="3"
++            rx="1"
++            fill={(value as string) || "currentColor"}
++          />
++        </>
++      ) : (
++        <text
++          x="12"
++          y="16.5"
++          textAnchor="middle"
++          fontSize={12}
++          fontWeight="700"
++          fill="currentColor"
++        >
++          {value ?? 16}
++        </text>
++      )}
++    </svg>
++  );
++}
+diff --git a/app/editor/menus/formatting.tsx b/app/editor/menus/formatting.tsx
+index 9f314a6..c577818 100644
+--- a/app/editor/menus/formatting.tsx
++++ b/app/editor/menus/formatting.tsx
+@@ -54,6 +54,10 @@ import Highlight from "@shared/editor/marks/Highlight";
+ import { DottedCircleIcon } from "~/components/Icons/DottedCircleIcon";
+ import TextDirectionIcon from "~/components/Icons/TextDirectionIcon";
+ import TextAlignIcon from "~/components/Icons/TextAlignIcon";
++import TextStyleIcon from "~/components/Icons/TextStyleIcon";
++import { getTextStyle } from "@shared/editor/queries/getTextStyle";
++import { fontFamilies, fontSizes, textColors } from "@shared/utils/textStyle";
++import { getFontLabel } from "~/utils/fontNames";
+ import {
+   getTextAlignment,
+   isTextAlignActive,
+@@ -103,6 +107,7 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+   const canFormat = !isInCodeBlock;
+   const textDirection = getTextDirection(state);
+   const textAlignment = getTextAlignment(state);
++  const textStyle = getTextStyle(state);
+ 
+   // The block controls come first, so they are the ones on screen with a bare
+   // cursor and the bar scrolls right to the text controls for a selection.
+@@ -587,6 +592,79 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+         ];
+       },
+     },
++    // The font and size controls follow the interface direction: in Persian
++    // the size is left of the font, in English right of it.
++    {
++      group: MenuItemGroup.inline,
++      tooltip: t("Font"),
++      // Shows the font of the selected text, in the interface language.
++      label: textStyle?.fontFamily
++        ? getFontLabel(textStyle.fontFamily)
++        : t("Font"),
++      skipIcon: true,
++      visible: !isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "setTextStyle",
++          label: t("Default font"),
++          active: () => !textStyle?.fontFamily,
++          attrs: { fontFamily: null },
++        },
++        // Fonts kept only for text styled before are not offered.
++        ...Object.entries(fontFamilies)
++          .filter(([, font]) => !font.legacy)
++          .map(([key, font]) => ({
++            name: "setTextStyle",
++            label: getFontLabel(key),
++            active: () => textStyle?.fontFamily === key,
++            attrs: { fontFamily: key },
++          })),
++      ],
++    },
++    {
++      group: MenuItemGroup.inline,
++      tooltip: t("Font size"),
++      icon: <TextStyleIcon kind="size" value={textStyle?.fontSize} />,
++      active: () => !!textStyle?.fontSize,
++      visible: !isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "setTextStyle",
++          label: t("Default size"),
++          active: () => !textStyle?.fontSize,
++          attrs: { fontSize: null },
++        },
++        ...fontSizes.map((size) => ({
++          name: "setTextStyle",
++          label: String(size),
++          active: () => textStyle?.fontSize === size,
++          attrs: { fontSize: size },
++        })),
++      ],
++    },
++    {
++      group: MenuItemGroup.inline,
++      tooltip: t("Text color"),
++      icon: <TextStyleIcon kind="color" value={textStyle?.color} />,
++      active: () => !!textStyle?.color,
++      visible: !isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "setTextStyle",
++          label: t("Default color"),
++          icon: <DottedCircleIcon retainColor color="transparent" />,
++          active: () => !textStyle?.color,
++          attrs: { color: null },
++        },
++        ...textColors.map((color) => ({
++          name: "setTextStyle",
++          label: t(color.name),
++          icon: <CircleIcon retainColor color={color.hex} />,
++          active: () => textStyle?.color === color.hex,
++          attrs: { color: color.hex },
++        })),
++      ],
++    },
+     {
+       name: "code_inline",
+       group: MenuItemGroup.inline,
+diff --git a/app/utils/fontNames.ts b/app/utils/fontNames.ts
+new file mode 100644
+index 0000000..af97997
+--- /dev/null
++++ b/app/utils/fontNames.ts
+@@ -0,0 +1,29 @@
++import i18n from "i18next";
++import { fontFamilies } from "@shared/utils/textStyle";
++import names from "../../public/fonts/names.json";
++
++/** Font names by font key and language, e.g. { vazirmatn: { fa: "وزیرمتن" } }. */
++const localizedNames: Record<string, Record<string, string>> = names;
++
++/**
++ * Returns the name of a font in the interface language. Names come from
++ * public/fonts/names.json, keyed by language ("fa") or locale ("fa_IR"); a
++ * font without a name for the language shows its own (English) name.
++ *
++ * @param key the font family key, e.g. "vazirmatn".
++ * @param language the language, defaults to the interface language.
++ * @returns the localized font name.
++ */
++export function getFontLabel(
++  key: string,
++  language: string = i18n.language ?? ""
++): string {
++  const entry = localizedNames[key];
++  const locale = language.replace("-", "_");
++  return (
++    entry?.[locale] ??
++    entry?.[locale.split("_")[0]] ??
++    fontFamilies[key]?.label ??
++    key
++  );
++}
+diff --git a/public/fonts/names.json b/public/fonts/names.json
+new file mode 100644
+index 0000000..6819fc0
+--- /dev/null
++++ b/public/fonts/names.json
+@@ -0,0 +1,13 @@
++{
++  "vazirmatn": { "fa": "وزیرمتن" },
++  "sahel": { "fa": "ساحل" },
++  "shabnam": { "fa": "شبنم" },
++  "samim": { "fa": "صمیم" },
++  "parastoo": { "fa": "پرستو" },
++  "inter": { "fa": "اینتر" },
++  "tahoma": { "fa": "تاهوما" },
++  "arial": { "fa": "آریال" },
++  "times": { "fa": "تایمز نیو رومن" },
++  "georgia": { "fa": "جورجیا" },
++  "courier": { "fa": "کوریر نیو" }
++}
+diff --git a/server/static/index.html b/server/static/index.html
+index 03a54a1..1f8f96a 100644
+--- a/server/static/index.html
++++ b/server/static/index.html
+@@ -65,6 +65,111 @@
+         src: url("{cdn-url}/fonts/Inter-italic.var.woff2") format("woff2");
+       }
+ 
++      @font-face {
++        font-family: "Vazirmatn";
++        font-display: swap;
++        font-weight: 100 900;
++        src: url("{cdn-url}/fonts/Vazirmatn-VF.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Sahel";
++        font-display: swap;
++        font-weight: 300;
++        src: url("{cdn-url}/fonts/Sahel-Light.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Sahel";
++        font-display: swap;
++        font-weight: 400;
++        src: url("{cdn-url}/fonts/Sahel.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Sahel";
++        font-display: swap;
++        font-weight: 600;
++        src: url("{cdn-url}/fonts/Sahel-SemiBold.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Sahel";
++        font-display: swap;
++        font-weight: 700;
++        src: url("{cdn-url}/fonts/Sahel-Bold.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Shabnam";
++        font-display: swap;
++        font-weight: 100;
++        src: url("{cdn-url}/fonts/Shabnam-Thin.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Shabnam";
++        font-display: swap;
++        font-weight: 300;
++        src: url("{cdn-url}/fonts/Shabnam-Light.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Shabnam";
++        font-display: swap;
++        font-weight: 400;
++        src: url("{cdn-url}/fonts/Shabnam.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Shabnam";
++        font-display: swap;
++        font-weight: 500;
++        src: url("{cdn-url}/fonts/Shabnam-Medium.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Shabnam";
++        font-display: swap;
++        font-weight: 700;
++        src: url("{cdn-url}/fonts/Shabnam-Bold.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Samim";
++        font-display: swap;
++        font-weight: 400;
++        src: url("{cdn-url}/fonts/Samim.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Samim";
++        font-display: swap;
++        font-weight: 500;
++        src: url("{cdn-url}/fonts/Samim-Medium.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Samim";
++        font-display: swap;
++        font-weight: 700;
++        src: url("{cdn-url}/fonts/Samim-Bold.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Parastoo";
++        font-display: swap;
++        font-weight: 400;
++        src: url("{cdn-url}/fonts/Parastoo.woff2") format("woff2");
++      }
++
++      @font-face {
++        font-family: "Parastoo";
++        font-display: swap;
++        font-weight: 700;
++        src: url("{cdn-url}/fonts/Parastoo-Bold.woff2") format("woff2");
++      }
++
+       body,
+       html {
+         margin: 0;
+diff --git a/shared/editor/marks/TextStyle.ts b/shared/editor/marks/TextStyle.ts
+new file mode 100644
+index 0000000..6175ad3
+--- /dev/null
++++ b/shared/editor/marks/TextStyle.ts
+@@ -0,0 +1,166 @@
++import type { MarkSpec, MarkType } from "prosemirror-model";
++import type { Command } from "prosemirror-state";
++import type { TextStyleAttrs } from "../../utils/textStyle";
++import {
++  fontFamilies,
++  toFontFamily,
++  toFontSize,
++  toTextColor,
++  toPastedTextStyle,
++} from "../../utils/textStyle";
++import { isInCode } from "../queries/isInCode";
++import Mark from "./Mark";
++
++/** Marks spans written by the editor, as opposed to pasted ones. */
++const dataAttribute = "data-text-style";
++
++/**
++ * A mark for the font, size and color of a piece of text. All three are
++ * optional; a missing value leaves the default look.
++ */
++export default class TextStyle extends Mark {
++  get name() {
++    return "text_style";
++  }
++
++  get schema(): MarkSpec {
++    return {
++      attrs: {
++        fontFamily: {
++          default: null,
++          validate: (v: unknown) => v === null || toFontFamily(v) === v,
++        },
++        fontSize: {
++          default: null,
++          validate: (v: unknown) => v === null || toFontSize(v) === v,
++        },
++        color: {
++          default: null,
++          validate: (v: unknown) => v === null || toTextColor(v) === v,
++        },
++      },
++      parseDOM: [
++        {
++          tag: "span[style]",
++          consuming: false,
++          getAttrs: (dom) => {
++            const attrs: TextStyleAttrs = {
++              fontFamily: toFontFamily(dom.style.fontFamily),
++              fontSize: toFontSize(dom.style.fontSize),
++              color: toTextColor(dom.style.color),
++            };
++            // Spans written by the editor are marked and keep every value;
++            // styles pasted from elsewhere, e.g. black 11pt Arial from a word
++            // processor, are kept only when they match a value in the menus.
++            const result = dom.hasAttribute(dataAttribute)
++              ? attrs
++              : toPastedTextStyle(attrs);
++            return result.fontFamily || result.fontSize || result.color
++              ? result
++              : false;
++          },
++        },
++      ],
++      toDOM: (mark) => {
++        const { fontFamily, fontSize, color } = mark.attrs;
++        const style = [
++          fontFamily && fontFamilies[fontFamily]
++            ? `font-family: ${fontFamilies[fontFamily].css}`
++            : "",
++          fontSize ? `font-size: ${fontSize}px` : "",
++          color ? `color: ${color}` : "",
++        ]
++          .filter(Boolean)
++          .join("; ");
++        return ["span", { style, [dataAttribute]: "" }, 0];
++      },
++    };
++  }
++
++  commands({ type }: { type: MarkType }) {
++    return {
++      setTextStyle: (attrs?: unknown) => setTextStyle(type, attrs),
++    };
++  }
++
++  toMarkdown() {
++    // Markdown has no way to express font, size or color.
++    return {
++      open: "",
++      close: "",
++      mixable: true,
++      expelEnclosingWhitespace: true,
++    };
++  }
++}
++
++/**
++ * Changes the font, size or color of the selected text, or of the text typed
++ * next at a bare cursor. A value that is present in `attrs` replaces the old
++ * one, and null clears it; values that are absent are kept.
++ *
++ * @param type the text style mark type.
++ * @param attrs the changes, e.g. `{ fontSize: 18 }`.
++ * @returns the command.
++ */
++function setTextStyle(type: MarkType, attrs: unknown): Command {
++  const input = (attrs && typeof attrs === "object" ? attrs : {}) as Record<
++    string,
++    unknown
++  >;
++  const merge = (
++    old: Partial<TextStyleAttrs> | undefined
++  ): TextStyleAttrs | null => {
++    const next: TextStyleAttrs = {
++      fontFamily: old?.fontFamily ?? null,
++      fontSize: old?.fontSize ?? null,
++      color: old?.color ?? null,
++    };
++    if ("fontFamily" in input) {
++      next.fontFamily = toFontFamily(input.fontFamily);
++    }
++    if ("fontSize" in input) {
++      next.fontSize = toFontSize(input.fontSize);
++    }
++    if ("color" in input) {
++      next.color = toTextColor(input.color);
++    }
++    return next.fontFamily || next.fontSize || next.color ? next : null;
++  };
++
++  return (state, dispatch) => {
++    if (isInCode(state)) {
++      return false;
++    }
++    const tr = state.tr;
++    const { selection } = state;
++
++    if (selection.empty) {
++      const marks = state.storedMarks ?? selection.$from.marks();
++      const next = merge(marks.find((m) => m.type === type)?.attrs);
++      const others = marks.filter((m) => m.type !== type);
++      tr.setStoredMarks(next ? [...others, type.create(next)] : others);
++    } else {
++      for (const range of selection.ranges) {
++        const from = range.$from.pos;
++        const to = range.$to.pos;
++        state.doc.nodesBetween(from, to, (node, pos) => {
++          if (!node.isInline) {
++            return true;
++          }
++          const start = Math.max(pos, from);
++          const end = Math.min(pos + node.nodeSize, to);
++          const next = merge(node.marks.find((m) => m.type === type)?.attrs);
++          tr.removeMark(start, end, type);
++          if (next) {
++            tr.addMark(start, end, type.create(next));
++          }
++          return false;
++        });
++      }
++    }
++
++    dispatch?.(tr);
++    return true;
++  };
++}
+diff --git a/shared/editor/nodes/index.ts b/shared/editor/nodes/index.ts
+index d5ef00e..9186027 100644
+--- a/shared/editor/nodes/index.ts
++++ b/shared/editor/nodes/index.ts
+@@ -14,6 +14,7 @@ import Bold from "../marks/Bold";
+ import Code from "../marks/Code";
+ import Comment from "../marks/Comment";
+ import Highlight from "../marks/Highlight";
++import TextStyle from "../marks/TextStyle";
+ import Italic from "../marks/Italic";
+ import Link from "../marks/Link";
+ import TemplatePlaceholder from "../marks/Placeholder";
+@@ -128,6 +129,7 @@ export const richExtensions: Nodes = [
+   HeadingPrefix,
+   HorizontalRule,
+   Highlight,
++  TextStyle,
+   TemplatePlaceholder,
+   Math,
+   MathBlock,
+diff --git a/shared/editor/queries/getTextStyle.ts b/shared/editor/queries/getTextStyle.ts
+new file mode 100644
+index 0000000..4444b2f
+--- /dev/null
++++ b/shared/editor/queries/getTextStyle.ts
+@@ -0,0 +1,38 @@
++import type { Mark } from "prosemirror-model";
++import type { EditorState } from "prosemirror-state";
++import type { TextStyleAttrs } from "../../utils/textStyle";
++
++/**
++ * Returns the text style mark at the cursor, or on the first text in the
++ * selection.
++ *
++ * @param state the editor state.
++ * @returns the mark attributes (fontFamily, fontSize, color), or null.
++ */
++export function getTextStyle(state: EditorState): TextStyleAttrs | null {
++  const type = state.schema.marks.text_style;
++  if (!type) {
++    return null;
++  }
++  const { selection } = state;
++  let marks: readonly Mark[] = [];
++
++  if (selection.empty) {
++    marks = state.storedMarks ?? selection.$from.marks();
++  } else {
++    state.doc.nodesBetween(selection.from, selection.to, (node) => {
++      if (node.isInline && !marks.length) {
++        marks = node.marks;
++      }
++      return !node.isInline;
++    });
++  }
++  const attrs = marks.find((m) => m.type === type)?.attrs;
++  return attrs
++    ? {
++        fontFamily: attrs.fontFamily ?? null,
++        fontSize: attrs.fontSize ?? null,
++        color: attrs.color ?? null,
++      }
++    : null;
++}
+diff --git a/shared/utils/textStyle.test.ts b/shared/utils/textStyle.test.ts
+new file mode 100644
+index 0000000..fd8a34c
+--- /dev/null
++++ b/shared/utils/textStyle.test.ts
+@@ -0,0 +1,46 @@
++import {
++  toFontFamily,
++  toFontSize,
++  toPastedTextStyle,
++  toTextColor,
++} from "./textStyle";
++
++describe("toFontFamily", () => {
++  it("accepts keys and CSS font stacks", () => {
++    expect(toFontFamily("sahel")).toBe("sahel");
++    expect(toFontFamily("Vazirmatn, Tahoma, sans-serif")).toBe("vazirmatn");
++    expect(toFontFamily("'Times New Roman', Times, serif")).toBe("times");
++    expect(toFontFamily("Comic Sans MS")).toBeNull();
++    expect(toFontFamily("")).toBeNull();
++  });
++});
++
++describe("toFontSize", () => {
++  it("converts px and pt and keeps sizes in range", () => {
++    expect(toFontSize(18)).toBe(18);
++    expect(toFontSize("24px")).toBe(24);
++    expect(toFontSize("12pt")).toBe(16);
++    expect(toFontSize("2em")).toBeNull();
++    expect(toFontSize(200)).toBeNull();
++  });
++});
++
++describe("toTextColor", () => {
++  it("accepts hex and rgb colors", () => {
++    expect(toTextColor("#dc2626")).toBe("#DC2626");
++    expect(toTextColor("rgb(220, 38, 38)")).toBe("#DC2626");
++    expect(toTextColor("red")).toBeNull();
++    expect(toTextColor("rgb(300, 0, 0)")).toBeNull();
++  });
++});
++
++describe("toPastedTextStyle", () => {
++  it("keeps only values offered in the menus", () => {
++    expect(
++      toPastedTextStyle({ fontFamily: "arial", fontSize: 15, color: "#000000" })
++    ).toEqual({ fontFamily: null, fontSize: null, color: null });
++    expect(
++      toPastedTextStyle({ fontFamily: "sahel", fontSize: 18, color: "#DC2626" })
++    ).toEqual({ fontFamily: "sahel", fontSize: 18, color: "#DC2626" });
++  });
++});
+diff --git a/shared/utils/textStyle.ts b/shared/utils/textStyle.ts
+new file mode 100644
+index 0000000..f57f4b7
+--- /dev/null
++++ b/shared/utils/textStyle.ts
+@@ -0,0 +1,158 @@
++/**
++ * Fonts, sizes and colors that text can be given with the text style mark.
++ * Only these values are accepted, so pasted content cannot inject arbitrary CSS.
++ */
++
++/**
++ * Font families by key. The first name of each stack is the font itself. Fonts
++ * without `legacy` are served from public/fonts (see index.html) so they show
++ * on any device; `legacy` ones rely on the system and are kept only so that
++ * text already styled with them still renders; they are not offered in the menu.
++ */
++export const fontFamilies: Record<
++  string,
++  { label: string; css: string; legacy?: boolean }
++> = {
++  vazirmatn: { label: "Vazirmatn", css: "Vazirmatn, Tahoma, sans-serif" },
++  sahel: { label: "Sahel", css: "Sahel, Vazirmatn, Tahoma, sans-serif" },
++  shabnam: { label: "Shabnam", css: "Shabnam, Vazirmatn, Tahoma, sans-serif" },
++  samim: { label: "Samim", css: "Samim, Vazirmatn, Tahoma, sans-serif" },
++  parastoo: {
++    label: "Parastoo",
++    css: "Parastoo, Vazirmatn, 'Times New Roman', serif",
++  },
++  inter: { label: "Inter", css: "Inter, Vazirmatn, sans-serif" },
++  tahoma: { label: "Tahoma", css: "Tahoma, sans-serif", legacy: true },
++  arial: {
++    label: "Arial",
++    css: "Arial, Helvetica, sans-serif",
++    legacy: true,
++  },
++  times: {
++    label: "Times New Roman",
++    css: "'Times New Roman', Times, serif",
++    legacy: true,
++  },
++  georgia: { label: "Georgia", css: "Georgia, serif", legacy: true },
++  courier: {
++    label: "Courier New",
++    css: "'Courier New', Courier, monospace",
++    legacy: true,
++  },
++};
++
++/** Font sizes in pixels offered in the menu. */
++export const fontSizes = [10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48];
++
++/** Text colors offered in the menu, readable on light and dark themes. */
++export const textColors = [
++  { name: "Gray", hex: "#6B7280" },
++  { name: "Red", hex: "#DC2626" },
++  { name: "Orange", hex: "#EA580C" },
++  { name: "Green", hex: "#16A34A" },
++  { name: "Teal", hex: "#0D9488" },
++  { name: "Blue", hex: "#2563EB" },
++  { name: "Purple", hex: "#7C3AED" },
++  { name: "Pink", hex: "#DB2777" },
++];
++
++/** The values of the text style mark; null leaves the default look. */
++export interface TextStyleAttrs {
++  fontFamily: string | null;
++  fontSize: number | null;
++  color: string | null;
++}
++
++/**
++ * Keeps only the values of a pasted style that are offered in the menus, so
++ * that text pasted from elsewhere does not bring fixed colors, which can be
++ * unreadable in the dark theme, or sizes and fonts that differ from the menu.
++ *
++ * @param attrs the values read from the pasted style.
++ * @returns the values that are offered in the menus, the others null.
++ */
++export function toPastedTextStyle(attrs: TextStyleAttrs): TextStyleAttrs {
++  const { fontFamily, fontSize, color } = attrs;
++  return {
++    fontFamily:
++      fontFamily && !fontFamilies[fontFamily]?.legacy ? fontFamily : null,
++    fontSize: fontSize && fontSizes.includes(fontSize) ? fontSize : null,
++    color: color && textColors.some((c) => c.hex === color) ? color : null,
++  };
++}
++
++/**
++ * Restricts a value to a known font family key.
++ *
++ * @param value a key, or a CSS font-family value from pasted content.
++ * @returns the key, or null.
++ */
++export function toFontFamily(value: unknown): string | null {
++  if (typeof value !== "string" || !value) {
++    return null;
++  }
++  if (value in fontFamilies) {
++    return value;
++  }
++  const first = value.split(",")[0].replace(/['"]/g, "").trim().toLowerCase();
++  return (
++    Object.keys(fontFamilies).find(
++      (key) =>
++        fontFamilies[key].css
++          .split(",")[0]
++          .replace(/['"]/g, "")
++          .trim()
++          .toLowerCase() === first
++    ) ?? null
++  );
++}
++
++/**
++ * Restricts a value to a font size in pixels between 8 and 96.
++ *
++ * @param value a number, or a CSS size in px or pt.
++ * @returns the size in pixels, or null.
++ */
++export function toFontSize(value: unknown): number | null {
++  let size: number;
++  if (typeof value === "number") {
++    size = value;
++  } else if (typeof value === "string") {
++    const match = value.trim().match(/^(\d+(?:\.\d+)?)(px|pt)$/);
++    if (!match) {
++      return null;
++    }
++    size = match[2] === "pt" ? (parseFloat(match[1]) * 4) / 3 : +match[1];
++  } else {
++    return null;
++  }
++  size = Math.round(size);
++  return size >= 8 && size <= 96 ? size : null;
++}
++
++/**
++ * Restricts a value to a 6-digit hex color.
++ *
++ * @param value a hex color, or a CSS rgb() value from pasted content.
++ * @returns the upper-case hex color, or null.
++ */
++export function toTextColor(value: unknown): string | null {
++  if (typeof value !== "string") {
++    return null;
++  }
++  if (/^#[0-9a-f]{6}$/i.test(value)) {
++    return value.toUpperCase();
++  }
++  const rgb = value.match(/^rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)$/);
++  if (!rgb) {
++    return null;
++  }
++  const channels = rgb.slice(1).map(Number);
++  return channels.every((c) => c <= 255)
++    ? "#" +
++        channels
++          .map((c) => c.toString(16).padStart(2, "0"))
++          .join("")
++          .toUpperCase()
++    : null;
++}

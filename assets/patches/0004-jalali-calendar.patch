@@ -1,0 +1,1618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Thu, 15 Oct 2026 17:00:00 +0330
+Subject: [PATCH 04/18] feat: Solar Hijri (Jalali) calendar for displayed dates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 3.1 (2026-10-15)  3.1 = Gregorian month header like the Jalali one
+  (month centered, previous/next buttons on both sides, pointing outwards).
+  Before: 3.0 (2026-10-15)  3.0 = + Gregorian | Jalali switch inside the calendar (old 0019).
+  Before: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001..0003)
+
+(was 0007 v1.0)
+- New user preferences: Calendar (gregorian | persian), defaulting to
+  Persian when the interface language is Persian, and Date format (month
+  names | numeric yyyy/MM/dd) for the Persian calendar. Both are validated
+  by the API and shown in Settings > Preferences.
+- formatDate() in shared/utils/date wraps date-fns format: in the Persian
+  calendar the year, month and day tokens are converted with Intl (no new
+  dependency), day-month-year order for Persian, Persian digits; Intl
+  formatters are cached.
+- Used for timestamps, date mentions, history labels, expiry dates and the
+  insert-date commands. Stored values stay Gregorian ISO strings.
+- Date pickers show a Persian month grid (week starting Saturday) when the
+  calendar is Persian; fromPersianDate() is the inverse of toPersianDate().
+
+Switch inside the calendar (was 0019 v1.0):
+The calendar opened from a date in a document has a small switch above the
+month: Gregorian | Jalali (میلادی | شمسی). Choosing one changes the whole
+calendar (month grid, month names, week start) and the date text shown in the
+document. The choice is saved as the user's Calendar preference (the same one
+as Settings > Preferences), so it stays the same after reload. Stored dates are
+unchanged (Gregorian ISO).
+
+The switch is shown only where a caller passes onCalendarChange (the date
+mention picker); the API key expiry picker is unchanged.
+
+Files (17; N = new, M = modified, D = deleted):
+  M app/components/Authenticated.tsx
+  M app/hooks/useLocaleTime.ts
+  N app/hooks/useUserCalendar.ts
+  N app/hooks/useUserDateFormat.ts
+  M app/scenes/ApiKeyNew/components/ExpiryDatePicker.tsx
+  M app/scenes/Document/components/History/HighlightChangesControl.tsx
+  M app/scenes/Settings/Preferences.tsx
+  M app/utils/date.ts
+  M server/routes/api/users/schema.ts
+  M shared/components/Calendar.tsx
+  N shared/components/PersianCalendar.tsx
+  M shared/editor/components/DateMentionPicker.tsx
+  M shared/editor/components/Mentions.tsx
+  M shared/types.ts
+  N shared/utils/calendar.test.ts
+  N shared/utils/calendar.ts
+  M shared/utils/date.ts
+
+---
+---
+
+diff --git a/app/components/Authenticated.tsx b/app/components/Authenticated.tsx
+index 734904f..bccd3bf 100644
+--- a/app/components/Authenticated.tsx
++++ b/app/components/Authenticated.tsx
+@@ -2,7 +2,10 @@ import { observer } from "mobx-react";
+ import { useEffect, useRef } from "react";
+ import { useTranslation } from "react-i18next";
+ import { Redirect } from "react-router-dom";
++import { setCalendar, setDateFormat } from "@shared/utils/calendar";
+ import useCurrentUser from "~/hooks/useCurrentUser";
++import useUserCalendar from "~/hooks/useUserCalendar";
++import useUserDateFormat from "~/hooks/useUserDateFormat";
+ import useStores from "~/hooks/useStores";
+ import { changeLanguage } from "~/utils/language";
+ import LoadingIndicator from "./LoadingIndicator";
+@@ -17,6 +20,13 @@ const Authenticated = ({ children }: Props) => {
+   const user = useCurrentUser({ rejectOnEmpty: false });
+   const language = user?.language;
+   const hasLoggedOut = useRef(false);
++  const calendar = useUserCalendar();
++  const dateFormat = useUserDateFormat();
++
++  // Set during render, rather than in an effect, so that dates rendered by
++  // the children in this same pass already use the chosen calendar.
++  setCalendar(calendar);
++  setDateFormat(dateFormat);
+ 
+   // Watching for language changes here as this is the earliest point we might have the user
+   // available and means we can start loading translations faster
+diff --git a/app/hooks/useLocaleTime.ts b/app/hooks/useLocaleTime.ts
+index 414c6e5..3d4f3e7 100644
+--- a/app/hooks/useLocaleTime.ts
++++ b/app/hooks/useLocaleTime.ts
+@@ -1,7 +1,7 @@
+-import { format as formatDate } from "date-fns";
+ import { useState, useRef, useEffect } from "react";
+ import type { locales } from "@shared/utils/date";
+-import { dateLocale, dateToRelative } from "@shared/utils/date";
++import { dateLocale, dateToRelative, formatDate } from "@shared/utils/date";
++import useUserCalendar from "~/hooks/useUserCalendar";
+ import useUserLocale from "~/hooks/useUserLocale";
+ 
+ let callbacks: (() => void)[] = [];
+@@ -36,6 +36,7 @@ export const useLocaleTime = ({
+   relative,
+ }: Props) => {
+   const userLocale = useUserLocale();
++  const calendar = useUserCalendar();
+   const dateFormatLong: Record<string, string> = {
+     en_US: "MMMM do, yyyy h:mm a",
+     fr_FR: "'Le 'd MMMM yyyy 'à' H:mm",
+@@ -70,12 +71,14 @@ export const useLocaleTime = ({
+ 
+   const tooltipContent = formatDate(date, formatLocaleLong, {
+     locale,
++    calendar,
+   });
+   const content =
+     relative !== false
+       ? relativeContent
+       : formatDate(date, formatLocale, {
+           locale,
++          calendar,
+         });
+ 
+   return {
+diff --git a/app/hooks/useUserCalendar.ts b/app/hooks/useUserCalendar.ts
+new file mode 100644
+index 0000000..9863a7e
+--- /dev/null
++++ b/app/hooks/useUserCalendar.ts
+@@ -0,0 +1,17 @@
++import { UserPreference } from "@shared/types";
++import { resolveCalendar } from "@shared/utils/calendar";
++import useCurrentUser from "./useCurrentUser";
++
++/**
++ * Returns the calendar used to display dates for the current user: their
++ * preference, or the Persian calendar when the interface language is Persian.
++ *
++ * @returns the calendar.
++ */
++export default function useUserCalendar() {
++  const user = useCurrentUser({ rejectOnEmpty: false });
++  return resolveCalendar(
++    user?.preferences?.[UserPreference.Calendar],
++    user?.language
++  );
++}
+diff --git a/app/hooks/useUserDateFormat.ts b/app/hooks/useUserDateFormat.ts
+new file mode 100644
+index 0000000..feab0b0
+--- /dev/null
++++ b/app/hooks/useUserDateFormat.ts
+@@ -0,0 +1,14 @@
++import { UserPreference } from "@shared/types";
++import { resolveDateFormat } from "@shared/utils/calendar";
++import useCurrentUser from "./useCurrentUser";
++
++/**
++ * Returns how dates are written in the Persian calendar for the current user:
++ * their preference, or month names by default.
++ *
++ * @returns the date format.
++ */
++export default function useUserDateFormat() {
++  const user = useCurrentUser({ rejectOnEmpty: false });
++  return resolveDateFormat(user?.preferences?.[UserPreference.DateFormat]);
++}
+diff --git a/app/scenes/ApiKeyNew/components/ExpiryDatePicker.tsx b/app/scenes/ApiKeyNew/components/ExpiryDatePicker.tsx
+index 516e998..d4392ab 100644
+--- a/app/scenes/ApiKeyNew/components/ExpiryDatePicker.tsx
++++ b/app/scenes/ApiKeyNew/components/ExpiryDatePicker.tsx
+@@ -1,9 +1,8 @@
+-import { format as formatDate } from "date-fns";
+ import * as React from "react";
+ import { useTranslation } from "react-i18next";
+ import styled from "styled-components";
+ import { Calendar } from "@shared/components/Calendar";
+-import { dateLocale } from "@shared/utils/date";
++import { dateLocale, formatDate } from "@shared/utils/date";
+ import Button from "~/components/Button";
+ import {
+   Popover,
+diff --git a/app/scenes/Document/components/History/HighlightChangesControl.tsx b/app/scenes/Document/components/History/HighlightChangesControl.tsx
+index 779647d..946b4d8 100644
+--- a/app/scenes/Document/components/History/HighlightChangesControl.tsx
++++ b/app/scenes/Document/components/History/HighlightChangesControl.tsx
+@@ -1,9 +1,8 @@
+-import { format as formatDate } from "date-fns";
+ import * as React from "react";
+ import { useTranslation } from "react-i18next";
+ import styled from "styled-components";
+ import Text from "@shared/components/Text";
+-import { dateLocale } from "@shared/utils/date";
++import { dateLocale, formatDate } from "@shared/utils/date";
+ import { RevisionHelper } from "@shared/utils/RevisionHelper";
+ import type Document from "~/models/Document";
+ import type Event from "~/models/Event";
+diff --git a/app/scenes/Settings/Preferences.tsx b/app/scenes/Settings/Preferences.tsx
+index d849d91..a02d17e 100644
+--- a/app/scenes/Settings/Preferences.tsx
++++ b/app/scenes/Settings/Preferences.tsx
+@@ -5,10 +5,13 @@ import { Trans, useTranslation } from "react-i18next";
+ import { toast } from "sonner";
+ import { languageOptions as availableLanguages } from "@shared/i18n";
+ import {
++  CalendarType,
++  DateFormatType,
+   NotificationBadgeType,
+   TeamPreference,
+   UserPreference,
+ } from "@shared/types";
++import { dateLocale, formatDate } from "@shared/utils/date";
+ import { Theme } from "~/stores/UiStore";
+ import Button from "~/components/Button";
+ import Heading from "~/components/Heading";
+@@ -21,6 +24,8 @@ import useCurrentTeam from "~/hooks/useCurrentTeam";
+ import useCurrentUser from "~/hooks/useCurrentUser";
+ import usePolicy from "~/hooks/usePolicy";
+ import useStores from "~/hooks/useStores";
++import useUserCalendar from "~/hooks/useUserCalendar";
++import useUserDateFormat from "~/hooks/useUserDateFormat";
+ import UserDelete from "../UserDelete";
+ import { AutoLaunchSetting } from "./components/AutoLaunchSetting";
+ import SettingRow from "./components/SettingRow";
+@@ -151,6 +156,67 @@ function Preferences() {
+     [user, t]
+   );
+ 
++  const calendar = useUserCalendar();
++
++  const calendarOptions: Option[] = React.useMemo(
++    () => [
++      {
++        type: "item",
++        label: t("Gregorian"),
++        value: CalendarType.Gregorian,
++      },
++      {
++        type: "item",
++        label: t("Solar Hijri (Jalali)"),
++        value: CalendarType.Persian,
++      },
++    ],
++    [t]
++  );
++
++  const handleCalendarChange = React.useCallback(
++    async (value: string) => {
++      user.setPreference(UserPreference.Calendar, value as CalendarType);
++      await user.save();
++      toast.success(t("Preferences saved"));
++    },
++    [user, t]
++  );
++
++  const dateFormat = useUserDateFormat();
++
++  // The options show today's date as it would be written in each format.
++  const dateFormatOptions: Option[] = React.useMemo(() => {
++    const locale = dateLocale(user.language);
++    const example = (format: DateFormatType) =>
++      formatDate(new Date(), "MMMM do, yyyy", {
++        locale,
++        calendar: CalendarType.Persian,
++        dateFormat: format,
++      });
++    return [
++      {
++        type: "item",
++        label: example(DateFormatType.Text),
++        value: DateFormatType.Text,
++      },
++      {
++        type: "item",
++        label: example(DateFormatType.Numeric),
++        value: DateFormatType.Numeric,
++      },
++    ];
++  }, [user.language]);
++
++  const handleDateFormatChange = React.useCallback(
++    async (value: string) => {
++      user.setPreference(UserPreference.DateFormat, value as DateFormatType);
++      await user.save();
++      toast.success(t("Preferences saved"));
++    },
++    [user, t]
++  );
++
+   const handleLanguageChange = React.useCallback(
+     async (language: string) => {
+       await user.save({ language });
+@@ -210,6 +276,34 @@ function Preferences() {
+           labelHidden
+         />
+       </SettingRow>
++      <SettingRow
++        name={UserPreference.Calendar}
++        label={t("Calendar")}
++        description={t("Choose the calendar used to display dates.")}
++      >
++        <InputSelect
++          options={calendarOptions}
++          value={calendar}
++          onChange={handleCalendarChange}
++          label={t("Calendar")}
++          labelHidden
++        />
++      </SettingRow>
++      {calendar === CalendarType.Persian && (
++        <SettingRow
++          name={UserPreference.DateFormat}
++          label={t("Date format")}
++          description={t("Choose how dates are written.")}
++        >
++          <InputSelect
++            options={dateFormatOptions}
++            value={dateFormat}
++            onChange={handleDateFormatChange}
++            label={t("Date format")}
++            labelHidden
++          />
++        </SettingRow>
++      )}
+       <SettingRow
+         name="theme"
+         label={t("Appearance")}
+diff --git a/app/utils/date.ts b/app/utils/date.ts
+index 48bc94d..0a54c20 100644
+--- a/app/utils/date.ts
++++ b/app/utils/date.ts
+@@ -4,14 +4,13 @@ import {
+   differenceInCalendarWeeks,
+   differenceInCalendarMonths,
+   differenceInCalendarYears,
+-  format as formatDate,
+   isTomorrow,
+   isSameWeek,
+   isPast,
+ } from "date-fns";
+ import type { TFunction } from "i18next";
+ import type { locales } from "@shared/utils/date";
+-import { dateLocale } from "@shared/utils/date";
++import { dateLocale, formatDate } from "@shared/utils/date";
+ 
+ /**
+  * Converts a date to a human-readable heading such as "Today", "Yesterday",
+diff --git a/server/routes/api/users/schema.ts b/server/routes/api/users/schema.ts
+index 232359c..360635f 100644
+--- a/server/routes/api/users/schema.ts
++++ b/server/routes/api/users/schema.ts
+@@ -1,5 +1,7 @@
+ import { z } from "zod";
+ import {
++  CalendarType,
++  DateFormatType,
+   NotificationBadgeType,
+   NotificationEventType,
+   SidebarSection,
+@@ -129,6 +131,8 @@ export const UsersUpdateSchema = BaseSchema.extend({
+         [UserPreference.ShowDocumentStats]: z.boolean(),
+         [UserPreference.NotificationBadge]: z.enum(NotificationBadgeType),
+         [UserPreference.SidebarSectionOrder]: z.array(z.enum(SidebarSection)),
++        [UserPreference.Calendar]: z.enum(CalendarType),
++        [UserPreference.DateFormat]: z.enum(DateFormatType),
+       })
+       .partial()
+       .optional(),
+diff --git a/shared/components/Calendar.tsx b/shared/components/Calendar.tsx
+index 03dd8bb..4e13745 100644
+--- a/shared/components/Calendar.tsx
++++ b/shared/components/Calendar.tsx
+@@ -1,9 +1,20 @@
+ import * as React from "react";
+-import { DayPicker } from "react-day-picker";
++import type { CaptionProps } from "react-day-picker";
++import { DayPicker, useDayPicker, useNavigation } from "react-day-picker";
++import { useTranslation } from "react-i18next";
+ import styled from "styled-components";
+ import { s } from "../styles";
++import { CalendarType } from "../types";
++import { getCalendar } from "../utils/calendar";
++import type { PersianCalendarProps } from "./PersianCalendar";
++import { Chevron, PersianCalendar } from "./PersianCalendar";
+ 
+-type Props = React.ComponentProps<typeof DayPicker>;
++type Props = React.ComponentProps<typeof DayPicker> & {
++  /** The calendar to show; the user's calendar when omitted. */
++  calendar?: CalendarType;
++  /** When set, a Gregorian | Jalali switch is shown above the month. */
++  onCalendarChange?: (calendar: CalendarType) => void;
++};
+ 
+ /**
+  * A themed calendar built on react-day-picker. It is styled from scratch (the
+@@ -12,18 +23,135 @@ type Props = React.ComponentProps<typeof DayPicker>;
+  * shown de-emphasised, the selected day is a solid accent-filled circle, and
+  * today is highlighted with the accent colour.
+  *
++ * With the Persian calendar it renders a Persian month grid instead, which
++ * supports the `selected`, `defaultMonth`, `onSelect`, `disabled` and
++ * `locale` props.
++ *
++ * With `onCalendarChange` a small Gregorian | Jalali switch is shown above the
++ * month (KMS patch 0019); the caller decides what choosing one does.
++ *
+  * @param props the underlying react-day-picker props; `showOutsideDays` and
+  * `fixedWeeks` default to true but may be overridden.
+  * @returns the rendered calendar.
+  */
+-export function Calendar(props: Props) {
++export function Calendar({ calendar, onCalendarChange, ...props }: Props) {
++  const { t } = useTranslation();
++  const active = calendar ?? getCalendar();
++
++  // The Persian calendar is not supported by react-day-picker, so it has its
++  // own month grid, styled by the same wrapper.
+   return (
+     <Wrapper>
+-      <DayPicker showOutsideDays fixedWeeks {...props} />
++      {onCalendarChange && (
++        <CalendarSwitch role="group" aria-label={t("Calendar")}>
++          {[
++            { value: CalendarType.Gregorian, label: t("Gregorian") },
++            { value: CalendarType.Persian, label: t("Jalali") },
++          ].map((option) => (
++            <button
++              key={option.value}
++              type="button"
++              aria-pressed={active === option.value}
++              onClick={() => {
++                if (active !== option.value) {
++                  onCalendarChange(option.value);
++                }
++              }}
++            >
++              {option.label}
++            </button>
++          ))}
++        </CalendarSwitch>
++      )}
++      {active === CalendarType.Persian ? (
++        <PersianCalendar
++          key="persian"
++          {...(props as unknown as PersianCalendarProps)}
++        />
++      ) : (
++        <DayPicker
++          key="gregorian"
++          showOutsideDays
++          fixedWeeks
++          {...props}
++          components={{ Caption: GregorianCaption, ...props.components }}
++        />
++      )}
+     </Wrapper>
+   );
+ }
+ 
++/**
++ * The Gregorian month caption, laid out like the Persian one: the month
++ * centered between the previous and next buttons, each pointing outwards
++ * (previous on the start side, next on the end side of the grid).
++ *
++ * @param props the react-day-picker caption props.
++ * @returns the rendered caption.
++ */
++function GregorianCaption({ id, displayMonth }: CaptionProps) {
++  const { t } = useTranslation();
++  const { dir, locale, formatters } = useDayPicker();
++  const { previousMonth, nextMonth, goToMonth } = useNavigation();
++  const rtl = dir === "rtl";
++
++  return (
++    <div
++      className="rdp-caption rdp-caption_centered"
++      dir={rtl ? "rtl" : "ltr"}
++    >
++      <button
++        type="button"
++        className="rdp-nav_button"
++        aria-label={t("Previous")}
++        disabled={!previousMonth}
++        onClick={() => previousMonth && goToMonth(previousMonth)}
++      >
++        <Chevron flip={rtl} />
++      </button>
++      <div id={id} className="rdp-caption_label" aria-live="polite">
++        {formatters.formatCaption(displayMonth, { locale })}
++      </div>
++      <button
++        type="button"
++        className="rdp-nav_button"
++        aria-label={t("Next")}
++        disabled={!nextMonth}
++        onClick={() => nextMonth && goToMonth(nextMonth)}
++      >
++        <Chevron flip={!rtl} />
++      </button>
++    </div>
++  );
++}
++
++const CalendarSwitch = styled.div`
++  display: flex;
++  gap: 2px;
++  padding: 2px;
++  margin: 0 0 8px;
++  border-radius: 8px;
++  background: ${s("listItemHoverBackground")};
++
++  button {
++    flex: 1;
++    border: 0;
++    border-radius: 6px;
++    padding: 4px 8px;
++    background: none;
++    font-family: inherit;
++    font-size: 12px;
++    color: ${s("textSecondary")};
++    cursor: var(--pointer);
++
++    &[aria-pressed="true"] {
++      background: ${s("accent")};
++      color: ${s("accentText")};
++      font-weight: 600;
++    }
++  }
++`;
++
+ const Wrapper = styled.div`
+   padding: 12px;
+   color: ${s("text")};
+@@ -63,6 +191,12 @@ const Wrapper = styled.div`
+     color: ${s("text")};
+   }
+ 
++  /* Both calendars: the month centered between the two buttons. */
++  .rdp-caption_centered .rdp-caption_label {
++    flex: 1;
++    text-align: center;
++  }
++
+   .rdp-nav {
+     display: flex;
+     gap: 2px;
+@@ -82,9 +216,14 @@ const Wrapper = styled.div`
+     cursor: var(--pointer);
+     transition: background 100ms ease;
+ 
+-    &:hover {
++    &:hover:not([disabled]) {
+       background: ${s("listItemHoverBackground")};
+     }
++
++    &[disabled] {
++      opacity: 0.4;
++      cursor: default;
++    }
+   }
+ 
+   .rdp-nav_icon {
+diff --git a/shared/components/PersianCalendar.tsx b/shared/components/PersianCalendar.tsx
+new file mode 100644
+index 0000000..0999010
+--- /dev/null
++++ b/shared/components/PersianCalendar.tsx
+@@ -0,0 +1,240 @@
++import { differenceInCalendarDays, isSameDay } from "date-fns";
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import {
++  fromPersianDate,
++  getDateTimeFormat,
++  isPersianLanguage,
++  toPersianDate,
++  toPersianDigits,
++} from "../utils/calendar";
++import { isRTLLanguage } from "../utils/rtl";
++
++export type PersianCalendarProps = {
++  /** The selected day, if any. */
++  selected?: Date;
++  /** The day whose month is shown first, defaults to the selected day. */
++  defaultMonth?: Date;
++  /** Called with the day the user picked. */
++  onSelect?: (date: Date) => void;
++  /** Days that cannot be picked: `{ before }`, `{ after }`, a Date or a list. */
++  disabled?: unknown;
++  /** A date-fns locale, used for its language code. */
++  locale?: { code?: string };
++};
++
++type View = { year: number; month: number };
++
++/**
++ * Returns true if a day matches a disabled matcher.
++ *
++ * @param date the day.
++ * @param matcher `{ before }`, `{ after }`, a Date, or a list of those.
++ * @returns true if the day is disabled.
++ */
++function isDisabled(date: Date, matcher: unknown): boolean {
++  if (Array.isArray(matcher)) {
++    return matcher.some((item) => isDisabled(date, item));
++  }
++  if (matcher instanceof Date) {
++    return isSameDay(date, matcher);
++  }
++  if (matcher && typeof matcher === "object") {
++    const { before, after } = matcher as { before?: Date; after?: Date };
++    if (before instanceof Date && differenceInCalendarDays(date, before) < 0) {
++      return true;
++    }
++    if (after instanceof Date && differenceInCalendarDays(date, after) > 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++/**
++ * Moves a Persian month forwards or backwards.
++ *
++ * @param view the current year and month.
++ * @param delta the number of months to move, negative for earlier.
++ * @returns the new year and month.
++ */
++function shiftMonth(view: View, delta: number): View {
++  const index = view.year * 12 + (view.month - 1) + delta;
++  return { year: Math.floor(index / 12), month: (index % 12) + 1 };
++}
++
++/**
++ * A month calendar for the Persian (Solar Hijri) calendar, with the week
++ * starting on Saturday. It uses the same markup and class names as
++ * react-day-picker, so it is styled by `Calendar`, which renders it instead
++ * of the Gregorian picker when the user's calendar is Persian.
++ *
++ * @returns the rendered calendar.
++ */
++export function PersianCalendar({
++  selected,
++  defaultMonth,
++  onSelect,
++  disabled,
++  locale,
++}: PersianCalendarProps) {
++  const { t } = useTranslation();
++  const code = locale?.code ?? "en-US";
++  const isPersian = isPersianLanguage(code);
++  const rtl = isRTLLanguage(code);
++  const intlLocale = `${code}-u-ca-persian`;
++
++  const [view, setView] = React.useState<View>(() => {
++    const { year, month } = toPersianDate(
++      defaultMonth ?? selected ?? new Date()
++    );
++    return { year, month };
++  });
++
++  const first = fromPersianDate(view.year, view.month, 1);
++  // The caption is built from parts, month first, rather than with Intl's
++  // month and year pattern, which can put the year first.
++  const digits = (value: number) =>
++    isPersian ? toPersianDigits(String(value)) : String(value);
++  const monthFormat = getDateTimeFormat(intlLocale, { month: "long" });
++  const caption = `${monthFormat.format(first)} ${digits(view.year)}`;
++
++  const weekdayFormat = getDateTimeFormat(code, {
++    weekday: isPersian ? "narrow" : "short",
++  });
++  // 6 January 2024 was a Saturday, and the Persian week starts on Saturday.
++  const weekdays = Array.from({ length: 7 }, (_, i) =>
++    weekdayFormat.format(new Date(2024, 0, 6 + i, 12))
++  );
++
++  const weekdayLongFormat = getDateTimeFormat(code, {
++    weekday: "long",
++  });
++  const offset = (first.getDay() + 1) % 7;
++  const today = new Date();
++  const days = Array.from(
++    { length: 42 },
++    (_, i) =>
++      new Date(
++        first.getFullYear(),
++        first.getMonth(),
++        first.getDate() - offset + i,
++        12
++      )
++  );
++  const weeks = Array.from({ length: 6 }, (_, i) =>
++    days.slice(i * 7, i * 7 + 7)
++  );
++
++  const go = (delta: number) =>
++    setView((current) => shiftMonth(current, delta));
++
++  return (
++    <div className="rdp">
++      <div className="rdp-month">
++        {/* The month is centered between the buttons, laid out right to left
++            as the Persian calendar is: previous on the right, next on the
++            left, each pointing outwards. */}
++        <div className="rdp-caption rdp-caption_centered" dir="rtl">
++          <button
++            type="button"
++            className="rdp-nav_button"
++            aria-label={t("Previous")}
++            onClick={() => go(-1)}
++          >
++            <Chevron flip />
++          </button>
++          <div
++            className="rdp-caption_label"
++            dir={rtl ? "rtl" : "ltr"}
++            aria-live="polite"
++          >
++            {caption}
++          </div>
++          <button
++            type="button"
++            className="rdp-nav_button"
++            aria-label={t("Next")}
++            onClick={() => go(1)}
++          >
++            <Chevron flip={false} />
++          </button>
++        </div>
++        <table className="rdp-table" role="grid" aria-label={caption}>
++          <thead className="rdp-head">
++            <tr className="rdp-head_row">
++              {weekdays.map((label, i) => (
++                <th key={i} className="rdp-head_cell" scope="col">
++                  {label}
++                </th>
++              ))}
++            </tr>
++          </thead>
++          <tbody className="rdp-tbody">
++            {weeks.map((week) => (
++              <tr key={week[0].getTime()} className="rdp-row">
++                {week.map((day) => {
++                  const parts = toPersianDate(day);
++                  const outside = parts.month !== view.month;
++                  const isSelected = !!selected && isSameDay(day, selected);
++                  const classNames = ["rdp-day"];
++                  if (isSelected) {
++                    classNames.push("rdp-day_selected");
++                  }
++                  if (isSameDay(day, today)) {
++                    classNames.push("rdp-day_today");
++                  }
++                  if (outside) {
++                    classNames.push("rdp-day_outside");
++                  }
++                  return (
++                    <td
++                      key={day.getTime()}
++                      className="rdp-cell"
++                      role="gridcell"
++                    >
++                      <button
++                        type="button"
++                        className={classNames.join(" ")}
++                        aria-label={`${weekdayLongFormat.format(day)} ${digits(parts.day)} ${monthFormat.format(day)} ${digits(parts.year)}`}
++                        aria-pressed={isSelected}
++                        disabled={isDisabled(day, disabled)}
++                        onClick={() => {
++                          if (outside) {
++                            setView({ year: parts.year, month: parts.month });
++                          }
++                          onSelect?.(day);
++                        }}
++                      >
++                        {digits(parts.day)}
++                      </button>
++                    </td>
++                  );
++                })}
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </div>
++    </div>
++  );
++}
++
++/** A chevron pointing left, or right when flipped. */
++export function Chevron({ flip }: { flip: boolean }) {
++  return (
++    <svg
++      className="rdp-nav_icon"
++      viewBox="0 0 24 24"
++      fill="none"
++      stroke="currentColor"
++      strokeWidth="2"
++      strokeLinecap="round"
++      strokeLinejoin="round"
++      aria-hidden="true"
++      style={flip ? { transform: "scaleX(-1)" } : undefined}
++    >
++      <path d="M15 18l-6-6 6-6" />
++    </svg>
++  );
++}
+diff --git a/shared/editor/components/DateMentionPicker.tsx b/shared/editor/components/DateMentionPicker.tsx
+index fb36dc0..db0fdbc 100644
+--- a/shared/editor/components/DateMentionPicker.tsx
++++ b/shared/editor/components/DateMentionPicker.tsx
+@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
+ import { RemoveScroll } from "react-remove-scroll";
+ import styled from "styled-components";
+ import { Calendar } from "../../components/Calendar";
++import type { CalendarType } from "../../types";
+ import { depths, s, borderRadius } from "../../styles";
+ import { dateLocale, toISODate, toISODateTime } from "../../utils/date";
+ 
+@@ -16,6 +17,10 @@ type Props = {
+   includeTime?: boolean;
+   /** The user's language, used to localise the calendar. */
+   language?: Parameters<typeof dateLocale>[0];
++  /** The calendar the picker and the date display use. */
++  calendar?: CalendarType;
++  /** Called when Gregorian or Jalali is chosen inside the calendar. */
++  onCalendarChange?: (calendar: CalendarType) => void;
+   /** Called with the new ISO string when a day is picked. */
+   onChange: (modelId: string) => void;
+   /** The trigger element the calendar popover is anchored to. */
+@@ -34,6 +39,8 @@ export default function DateMentionPicker({
+   selectedDate,
+   includeTime,
+   language,
++  calendar,
++  onCalendarChange,
+   onChange,
+   children,
+ }: Props) {
+@@ -87,6 +94,8 @@ export default function DateMentionPicker({
+                 defaultMonth={selectedDate}
+                 onSelect={handleSelect}
+                 locale={dateLocale(language)}
++                calendar={calendar}
++                onCalendarChange={onCalendarChange}
+               />
+             </DatePopoverContent>
+           </RemoveScroll>
+diff --git a/shared/editor/components/Mentions.tsx b/shared/editor/components/Mentions.tsx
+index 1b7353d..a6650da 100644
+--- a/shared/editor/components/Mentions.tsx
++++ b/shared/editor/components/Mentions.tsx
+@@ -27,11 +27,14 @@ import useShare from "../../hooks/useShare";
+ import env from "../../env";
+ import theme from "../../styles/theme";
+ import {
++  CalendarType,
+   IntegrationService,
+   UnfurlResourceType,
++  UserPreference,
+   type JSONValue,
+   type UnfurlResponse,
+ } from "../../types";
++import { resolveCalendar, setCalendar } from "../../utils/calendar";
+ import { cn } from "../styles/utils";
+ import type { ComponentProps } from "../types";
+ import lazyWithRetry from "../../utils/lazyWithRetry";
+@@ -583,6 +586,29 @@ export const MentionDate = observer(function MentionDate_(props: DateProps) {
+ 
+   const language = auth.user?.language;
+   const iso = typeof node.attrs.modelId === "string" ? node.attrs.modelId : "";
++  // KMS patch 0019: the calendar is read here (observed), so choosing Gregorian
++  // or Jalali in the picker redraws this date too.
++  const calendar = resolveCalendar(
++    auth.user?.preferences?.[UserPreference.Calendar],
++    language
++  );
++  setCalendar(calendar);
++  const handleCalendarChange = React.useCallback(
++    async (value: CalendarType) => {
++      const user = auth.user;
++      if (!user) {
++        return;
++      }
++      setCalendar(value);
++      user.setPreference(UserPreference.Calendar, value);
++      try {
++        await user.save();
++      } catch {
++        // the choice still applies in this session
++      }
++    },
++    [auth]
++  );
+   const display = dateToRelativeReadable(iso, t, language);
+   const selectedDate = parseISODate(iso) ?? undefined;
+ 
+@@ -608,6 +634,8 @@ export const MentionDate = observer(function MentionDate_(props: DateProps) {
+         selectedDate={selectedDate}
+         includeTime={hasTimeComponent(iso)}
+         language={language}
++        calendar={calendar}
++        onCalendarChange={handleCalendarChange}
+         onChange={onChangeDate}
+       >
+         {content}
+diff --git a/shared/types/user.ts b/shared/types/user.ts
+index 0278314..1eeffe5 100644
+--- a/shared/types/user.ts
++++ b/shared/types/user.ts
+@@ -32,6 +32,24 @@ export enum UserPreference {
+   NotificationBadge = "notificationBadge",
+   /** The display order of the reorderable sections in the sidebar. */
+   SidebarSectionOrder = "sidebarSectionOrder",
++  /** The calendar used to display dates. */
++  Calendar = "calendar",
++  /** How dates are written in the Persian calendar. */
++  DateFormat = "dateFormat",
++}
++
++export enum DateFormatType {
++  /** Month names, e.g. 15 Azar 1406. */
++  Text = "text",
++  /** Numbers separated by slashes, e.g. 1406/09/15. */
++  Numeric = "numeric",
++}
++
++export enum CalendarType {
++  /** The Gregorian calendar. */
++  Gregorian = "gregorian",
++  /** The Solar Hijri (Jalali) calendar. */
++  Persian = "persian",
+ }
+ 
+ /** Styles of prefix that can be shown before headings. */
+@@ -80,4 +98,6 @@ export type UserPreferences = {
+   [UserPreference.ShowDocumentStats]?: boolean;
+   [UserPreference.NotificationBadge]?: NotificationBadgeType;
+   [UserPreference.SidebarSectionOrder]?: SidebarSection[];
++  [UserPreference.Calendar]?: CalendarType;
++  [UserPreference.DateFormat]?: DateFormatType;
+ };
+diff --git a/shared/utils/calendar.test.ts b/shared/utils/calendar.test.ts
+new file mode 100644
+index 0000000..f01078e
+--- /dev/null
++++ b/shared/utils/calendar.test.ts
+@@ -0,0 +1,133 @@
++import { CalendarType, DateFormatType } from "../types";
++import {
++  fromPersianDate,
++  isSameCalendarYear,
++  resolveCalendar,
++  resolveDateFormat,
++  toPersianDate,
++  toPersianDigits,
++  toPersianPattern,
++} from "./calendar";
++
++// 1 October 2026 is 9 Mehr 1405.
++const date = new Date(2026, 9, 1, 15, 30);
++
++describe("toPersianDate", () => {
++  it("converts Gregorian dates", () => {
++    expect(toPersianDate(date)).toEqual({ year: 1405, month: 7, day: 9 });
++    // Nowruz 1405 is 21 March 2026.
++    expect(toPersianDate(new Date(2026, 2, 21))).toEqual({
++      year: 1405,
++      month: 1,
++      day: 1,
++    });
++  });
++});
++
++describe("toPersianPattern", () => {
++  it("replaces year, month and day tokens", () => {
++    expect(toPersianPattern(date, "yyyy-MM-dd")).toBe("1405-07-09");
++    expect(toPersianPattern(date, "MMMM do, yyyy", "en-US")).toBe(
++      "'Mehr' '9th', 1405"
++    );
++    expect(toPersianPattern(date, "d MMMM yyyy", "fa-IR")).toBe("9 مهر 1405");
++  });
++
++  it("keeps quoted literals and time tokens", () => {
++    expect(toPersianPattern(date, "d MMMM yyyy 'um' H:mm")).toBe(
++      "9 'Mehr' 1405 'um' H:mm"
++    );
++    expect(toPersianPattern(date, "'Le 'd MMMM")).toBe("'Le '9 'Mehr'");
++    expect(toPersianPattern(date, "iiii p")).toBe("iiii p");
++    // A literal after a quoted section is merged, not doubled.
++    expect(toPersianPattern(date, "'at 'MMM")).toBe("'at Mehr'");
++  });
++});
++
++describe("isSameCalendarYear", () => {
++  it("compares years in the given calendar", () => {
++    // Both 2026, but 1404 and 1405 in the Persian calendar.
++    const a = new Date(2026, 0, 10);
++    const b = new Date(2026, 5, 10);
++    expect(isSameCalendarYear(a, b, CalendarType.Gregorian)).toBe(true);
++    expect(isSameCalendarYear(a, b, CalendarType.Persian)).toBe(false);
++  });
++});
++
++describe("resolveCalendar", () => {
++  it("uses the preference, else Persian for the Persian language", () => {
++    expect(resolveCalendar("gregorian", "fa_IR")).toBe(CalendarType.Gregorian);
++    expect(resolveCalendar(undefined, "fa_IR")).toBe(CalendarType.Persian);
++    expect(resolveCalendar(false, "en_US")).toBe(CalendarType.Gregorian);
++  });
++});
++
++describe("toPersianDigits", () => {
++  it("converts digits", () => {
++    expect(toPersianDigits("1405/07/09")).toBe("۱۴۰۵/۰۷/۰۹");
++  });
++});
++
++describe("fromPersianDate", () => {
++  it("converts Persian dates to Gregorian dates at noon", () => {
++    // 1 Mehr 1405 is 23 September 2026.
++    const result = fromPersianDate(1405, 7, 1);
++    expect([result.getFullYear(), result.getMonth(), result.getDate()]).toEqual(
++      [2026, 8, 23]
++    );
++    expect(result.getHours()).toBe(12);
++  });
++
++  it("is the inverse of toPersianDate", () => {
++    for (let i = 0; i < 800; i++) {
++      const day = new Date(2024, 0, 1 + i, 12);
++      const { year, month, day: dayOfMonth } = toPersianDate(day);
++      const result = fromPersianDate(year, month, dayOfMonth);
++      expect(result.toDateString()).toBe(day.toDateString());
++    }
++  });
++});
++
++describe("date formats", () => {
++  it("puts the day before the month in Persian", () => {
++    expect(
++      toPersianPattern(date, "MMMM do, yyyy", "fa-IR", DateFormatType.Text)
++    ).toBe("9 مهر 1405");
++    expect(
++      toPersianPattern(date, "MMMM do", "fa-IR", DateFormatType.Text)
++    ).toBe("9 مهر");
++    expect(
++      toPersianPattern(
++        date,
++        "MMMM do, yyyy h:mm a",
++        "fa-IR",
++        DateFormatType.Text
++      )
++    ).toBe("9 مهر 1405 h:mm a");
++  });
++
++  it("writes numeric dates in any language", () => {
++    expect(
++      toPersianPattern(date, "MMMM do, yyyy", "fa-IR", DateFormatType.Numeric)
++    ).toBe("1405/07/09");
++    expect(
++      toPersianPattern(date, "MMM dd, yyyy", "en-US", DateFormatType.Numeric)
++    ).toBe("1405/07/09");
++    expect(
++      toPersianPattern(date, "MMMM do", "fa-IR", DateFormatType.Numeric)
++    ).toBe("1405/07/09");
++  });
++
++  it("keeps the English order for other languages", () => {
++    expect(
++      toPersianPattern(date, "MMMM do, yyyy", "en-US", DateFormatType.Text)
++    ).toBe("'Mehr' '9th', 1405");
++  });
++
++  it("resolves the preference", () => {
++    expect(resolveDateFormat(DateFormatType.Numeric)).toBe(
++      DateFormatType.Numeric
++    );
++    expect(resolveDateFormat(undefined)).toBe(DateFormatType.Text);
++  });
++});
+diff --git a/shared/utils/calendar.ts b/shared/utils/calendar.ts
+new file mode 100644
+index 0000000..b914158
+--- /dev/null
++++ b/shared/utils/calendar.ts
+@@ -0,0 +1,412 @@
++import { CalendarType, DateFormatType } from "../types";
++
++/**
++ * Support for displaying dates in a calendar other than the Gregorian one,
++ * currently the Solar Hijri (Jalali, "persian") calendar. Conversion relies on
++ * the Intl API, so no additional dependency is needed.
++ */
++
++const formatters = new Map<string, Intl.DateTimeFormat>();
++let currentCalendar: CalendarType = CalendarType.Gregorian;
++let currentDateFormat: DateFormatType = DateFormatType.Text;
++
++/**
++ * Sets how dates are written in the Persian calendar in this client.
++ *
++ * @param dateFormat the date format.
++ */
++export function setDateFormat(dateFormat: DateFormatType): void {
++  currentDateFormat = dateFormat;
++}
++
++/**
++ * Returns how dates are written in the Persian calendar in this client.
++ *
++ * @returns the date format.
++ */
++export function getDateFormat(): DateFormatType {
++  return currentDateFormat;
++}
++
++/**
++ * Returns the date format to use for a user: their preference, or month names
++ * by default.
++ *
++ * @param preference the stored preference, if any.
++ * @returns the date format.
++ */
++export function resolveDateFormat(preference: unknown): DateFormatType {
++  return preference === DateFormatType.Numeric
++    ? DateFormatType.Numeric
++    : DateFormatType.Text;
++}
++
++/**
++ * Sets the calendar used to display dates in this client.
++ *
++ * @param calendar the calendar.
++ */
++export function setCalendar(calendar: CalendarType): void {
++  currentCalendar = calendar;
++}
++
++/**
++ * Returns the calendar used to display dates in this client.
++ *
++ * @returns the calendar.
++ */
++export function getCalendar(): CalendarType {
++  return currentCalendar;
++}
++
++/**
++ * Returns the calendar in the form the platform's Intl formatters expect for
++ * their `calendar` option ("gregory", not "gregorian", which is not a valid
++ * calendar identifier and makes Intl throw a RangeError).
++ *
++ * @returns the Intl calendar identifier.
++ */
++export function getIntlCalendar(): string {
++  return currentCalendar === CalendarType.Persian ? "persian" : "gregory";
++}
++
++/**
++ * Returns true if a language or locale code is Persian.
++ *
++ * @param code a language or locale code, e.g. "fa_IR" or "fa-IR".
++ * @returns true for Persian.
++ */
++export function isPersianLanguage(code: string | null | undefined): boolean {
++  return !!code && code.toLowerCase().startsWith("fa");
++}
++
++/**
++ * Returns an Intl date formatter, reused for the same locale and options,
++ * since creating one is slow and dates are formatted often.
++ *
++ * @param locale the BCP 47 locale, e.g. "fa-IR-u-ca-persian".
++ * @param options the format options.
++ * @returns the formatter.
++ */
++export function getDateTimeFormat(
++  locale: string,
++  options: Intl.DateTimeFormatOptions
++): Intl.DateTimeFormat {
++  const key = `${locale}|${JSON.stringify(options)}`;
++  let formatter = formatters.get(key);
++  if (!formatter) {
++    formatter = new Intl.DateTimeFormat(locale, options);
++    formatters.set(key, formatter);
++  }
++  return formatter;
++}
++
++/**
++ * Returns the calendar to use for a user: their preference, or the Persian
++ * calendar by default when the interface language is Persian.
++ *
++ * @param preference the stored preference, if any.
++ * @param language the user's language, e.g. "fa_IR".
++ * @returns the calendar.
++ */
++export function resolveCalendar(
++  preference: unknown,
++  language: string | null | undefined
++): CalendarType {
++  if (preference === CalendarType.Persian) {
++    return CalendarType.Persian;
++  }
++  if (preference === CalendarType.Gregorian) {
++    return CalendarType.Gregorian;
++  }
++  return isPersianLanguage(language)
++    ? CalendarType.Persian
++    : CalendarType.Gregorian;
++}
++
++/** The year, month (1-12) and day of a date in a calendar. */
++export interface CalendarDate {
++  year: number;
++  month: number;
++  day: number;
++}
++
++/**
++ * Returns the year, month and day of a date in the Persian calendar.
++ *
++ * @param date the date.
++ * @returns the Persian calendar date.
++ */
++export function toPersianDate(date: Date): CalendarDate {
++  const parts = getDateTimeFormat("en-u-ca-persian-nu-latn", {
++    year: "numeric",
++    month: "numeric",
++    day: "numeric",
++  }).formatToParts(date);
++  const get = (type: string) =>
++    parseInt(parts.find((part) => part.type === type)?.value ?? "0", 10);
++  return { year: get("year"), month: get("month"), day: get("day") };
++}
++
++/**
++ * Returns the date, at noon in local time, of a day in the Persian calendar.
++ * It is the inverse of `toPersianDate` and relies on the same Intl data, so
++ * both always agree. The day must exist in that month: the 30th of Esfand
++ * only exists in leap years.
++ *
++ * @param year the Persian year, e.g. 1405.
++ * @param month the Persian month, 1 (Farvardin) to 12 (Esfand).
++ * @param day the day of the month.
++ * @returns the date.
++ */
++export function fromPersianDate(
++  year: number,
++  month: number,
++  day: number
++): Date {
++  // Nowruz (1 Farvardin) falls between 19 and 22 March, so this estimate is
++  // at most a few days away from the right date.
++  const dayOfYear =
++    month <= 6 ? (month - 1) * 31 + day - 1 : 186 + (month - 7) * 30 + day - 1;
++  const date = new Date(year + 621, 2, 21 + dayOfYear, 12);
++  const target = year * 10000 + month * 100 + day;
++  const keyOf = (value: Date) => {
++    const parts = toPersianDate(value);
++    return parts.year * 10000 + parts.month * 100 + parts.day;
++  };
++
++  for (let i = 0; i < 10; i++) {
++    const current = keyOf(date);
++    if (current === target) {
++      break;
++    }
++    date.setDate(date.getDate() + (current < target ? 1 : -1));
++  }
++  return date;
++}
++
++/**
++ * Returns true if two dates are in the same year of the given calendar.
++ *
++ * @param a the first date.
++ * @param b the second date.
++ * @param calendar the calendar, defaults to the current one.
++ * @returns true if both dates are in the same year.
++ */
++export function isSameCalendarYear(
++  a: Date | number,
++  b: Date | number,
++  calendar: CalendarType = currentCalendar
++): boolean {
++  if (calendar === CalendarType.Persian) {
++    return toPersianDate(new Date(a)).year === toPersianDate(new Date(b)).year;
++  }
++  return new Date(a).getFullYear() === new Date(b).getFullYear();
++}
++
++const persianDigits = "۰۱۲۳۴۵۶۷۸۹";
++
++/**
++ * Replaces ASCII digits with Persian digits.
++ *
++ * @param text the text.
++ * @returns the text with Persian digits.
++ */
++export function toPersianDigits(text: string): string {
++  return text.replace(/[0-9]/g, (digit) => persianDigits[Number(digit)]);
++}
++
++/**
++ * Returns an English ordinal for a number, e.g. 1st, 22nd.
++ *
++ * @param value the number.
++ * @returns the ordinal.
++ */
++function englishOrdinal(value: number): string {
++  const rem100 = value % 100;
++  if (rem100 >= 11 && rem100 <= 13) {
++    return `${value}th`;
++  }
++  const suffix = ["th", "st", "nd", "rd"][value % 10] ?? "th";
++  return `${value}${value % 10 > 3 ? "th" : suffix}`;
++}
++
++const dateStyles: Record<number, "short" | "medium" | "long" | "full"> = {
++  1: "short",
++  2: "medium",
++  3: "long",
++  4: "full",
++};
++
++// A month name followed by the day and, optionally, the year, in the English
++// order of the patterns used by the app, e.g. "MMMM do, yyyy" or "MMM dd".
++const monthDayYear = /\b(MMMM|MMM) (do|dd|d)\b(?:, (yyyy|y)\b)?/;
++
++/**
++ * Rewrites the date part of a date-fns pattern for the chosen date format.
++ * With numeric dates it becomes "yyyy/MM/dd", in every language. With month
++ * names it is put in day, month, year order for Persian, e.g. "d MMMM yyyy",
++ * and left as it is for other languages.
++ *
++ * @param pattern the date-fns pattern.
++ * @param dateFormat the chosen date format.
++ * @param isPersianLanguage whether the language is Persian.
++ * @returns the rewritten pattern.
++ */
++function arrangeDatePattern(
++  pattern: string,
++  dateFormat: DateFormatType,
++  isPersianLanguage: boolean
++): string {
++  if (dateFormat === DateFormatType.Numeric) {
++    return pattern.replace(monthDayYear, "yyyy/MM/dd");
++  }
++  if (isPersianLanguage) {
++    return pattern.replace(
++      monthDayYear,
++      (_match, month: string, day: string, year?: string) =>
++        year ? `${day} ${month} ${year}` : `${day} ${month}`
++    );
++  }
++  return pattern;
++}
++
++/**
++ * Rewrites a date-fns format pattern so that the year, month and day are
++ * those of the Persian calendar. Those tokens are replaced with quoted
++ * literals; every other token (weekday, time, …) is left for date-fns, as it
++ * does not depend on the calendar.
++ *
++ * Supported tokens: y, yy, yyyy, M, MM, MMM, MMMM, MMMMM, L…, d, dd, do, Mo,
++ * and the localized dates P, PP, PPP, PPPP.
++ *
++ * @param date the date that will be formatted.
++ * @param pattern the date-fns pattern.
++ * @param localeCode a BCP 47 locale for month names, e.g. "fa-IR".
++ * @param dateFormat how the date is written, defaults to the current one.
++ * @returns the rewritten pattern.
++ */
++export function toPersianPattern(
++  date: Date,
++  pattern: string,
++  localeCode = "en-US",
++  dateFormat: DateFormatType = currentDateFormat
++): string {
++  const { year, month, day } = toPersianDate(date);
++  const locale = `${localeCode}-u-ca-persian`;
++  const isPersian = isPersianLanguage(localeCode);
++  pattern = arrangeDatePattern(pattern, dateFormat, isPersian);
++  const monthName = (style: "long" | "short" | "narrow") =>
++    getDateTimeFormat(locale, { month: style }).format(date);
++  const ordinal = (value: number) =>
++    isPersian ? String(value) : englishOrdinal(value);
++
++  let output = "";
++  let lastQuoted = false;
++  let i = 0;
++
++  // Appends text as a literal. Only ASCII letters and quotes need quoting in a
++  // date-fns pattern; a literal right after a quoted one is merged into it, as
++  // two adjacent quotes would be read as an escaped quote.
++  const literal = (text: string) => {
++    if (!/[a-zA-Z']/.test(text)) {
++      output += text;
++      lastQuoted = false;
++      return;
++    }
++    const escaped = text.replace(/'/g, "''");
++    output = lastQuoted
++      ? `${output.slice(0, -1)}${escaped}'`
++      : `${output}'${escaped}'`;
++    lastQuoted = true;
++  };
++
++  while (i < pattern.length) {
++    const char = pattern[i];
++
++    // Quoted literal, copied unchanged ('' is an escaped quote).
++    if (char === "'") {
++      let end = i + 1;
++      while (end < pattern.length) {
++        if (pattern[end] === "'" && pattern[end + 1] === "'") {
++          end += 2;
++          continue;
++        }
++        if (pattern[end] === "'") {
++          break;
++        }
++        end++;
++      }
++      const segment = pattern.slice(i, end + 1);
++      output += segment;
++      lastQuoted = segment.length > 2;
++      i = end + 1;
++      continue;
++    }
++
++    if (!/[a-zA-Z]/.test(char)) {
++      output += char;
++      lastQuoted = false;
++      i++;
++      continue;
++    }
++
++    let end = i;
++    while (pattern[end] === char) {
++      end++;
++    }
++    const length = end - i;
++    const isOrdinal = pattern[end] === "o";
++    const token = pattern.slice(i, end + (isOrdinal ? 1 : 0));
++    i = end + (isOrdinal ? 1 : 0);
++
++    switch (char) {
++      case "y":
++        literal(
++          isOrdinal
++            ? ordinal(year)
++            : length === 2
++              ? String(year % 100).padStart(2, "0")
++              : String(year).padStart(length, "0")
++        );
++        break;
++      case "M":
++      case "L":
++        literal(
++          isOrdinal
++            ? ordinal(month)
++            : length === 1
++              ? String(month)
++              : length === 2
++                ? String(month).padStart(2, "0")
++                : length === 3
++                  ? monthName("short")
++                  : length === 4
++                    ? monthName("long")
++                    : monthName("narrow")
++        );
++        break;
++      case "d":
++        literal(
++          isOrdinal
++            ? ordinal(day)
++            : length === 1
++              ? String(day)
++              : String(day).padStart(2, "0")
++        );
++        break;
++      case "P":
++        literal(
++          getDateTimeFormat(locale, {
++            dateStyle: dateStyles[Math.min(length, 4)],
++          }).format(date)
++        );
++        break;
++      default:
++        output += token;
++        lastQuoted = false;
++    }
++  }
++
++  return output;
++}
+diff --git a/shared/utils/date.ts b/shared/utils/date.ts
+index dd1cafe..81ae56c 100644
+--- a/shared/utils/date.ts
++++ b/shared/utils/date.ts
+@@ -4,7 +4,6 @@ import {
+   addSeconds,
+   format,
+   formatDistanceToNow,
+-  isSameYear,
+   isToday,
+   isTomorrow,
+   isYesterday,
+@@ -45,7 +44,16 @@ import { vi } from "date-fns/locale/vi";
+ import { uk } from "date-fns/locale/uk";
+ import { zhCN } from "date-fns/locale/zh-CN";
+ import { zhTW } from "date-fns/locale/zh-TW";
+-import type { DateFilter } from "../types";
++import type { DateFilter, DateFormatType } from "../types";
++import { CalendarType } from "../types";
++import {
++  getCalendar,
++  getIntlCalendar,
++  isPersianLanguage,
++  isSameCalendarYear,
++  toPersianDigits,
++  toPersianPattern,
++} from "./calendar";
+ import { isBrowser } from "./browser";
+ 
+ /**
+@@ -266,6 +274,7 @@ export function unicodeCLDRtoISO639(locale: string) {
+  */
+ export function getCurrentDateAsString(locale?: Intl.LocalesArgument) {
+   return new Date().toLocaleDateString(locale, {
++    calendar: getIntlCalendar(),
+     year: "numeric",
+     month: "long",
+     day: "numeric",
+@@ -292,6 +301,7 @@ export function getCurrentTimeAsString(locale?: Intl.LocalesArgument) {
+  */
+ export function getCurrentDateTimeAsString(locale?: Intl.LocalesArgument) {
+   return new Date().toLocaleString(locale, {
++    calendar: getIntlCalendar(),
+     year: "numeric",
+     month: "long",
+     day: "numeric",
+@@ -329,6 +339,43 @@ const locales = {
+   zh_TW: zhTW,
+ };
+ 
++/**
++ * Formats a date like date-fns `format`, using the calendar chosen by the user
++ * (see `setCalendar`). In the Persian calendar the year, month and day follow
++ * the Solar Hijri calendar, and digits are Persian for the Persian language.
++ * Use this for display only; stored values must stay Gregorian ISO strings.
++ *
++ * @param date the date.
++ * @param pattern a date-fns format pattern.
++ * @param options the date-fns locale, and optional calendar and date format
++ * overrides.
++ * @returns the formatted date.
++ */
++export function formatDate(
++  date: Date | number,
++  pattern: string,
++  options?: {
++    locale?: Locale;
++    calendar?: CalendarType;
++    dateFormat?: DateFormatType;
++  }
++): string {
++  const calendar = options?.calendar ?? getCalendar();
++  const locale = options?.locale;
++
++  if (calendar !== CalendarType.Persian) {
++    return format(date, pattern, { locale });
++  }
++
++  const code = locale?.code ?? "en-US";
++  const output = format(
++    date,
++    toPersianPattern(new Date(date), pattern, code, options?.dateFormat),
++    { locale }
++  );
++  return isPersianLanguage(code) ? toPersianDigits(output) : output;
++}
++
+ /**
+  * Returns the date-fns locale object for the given user language preference.
+  *
+@@ -426,10 +473,12 @@ function dateFormatter(
+   tag: string,
+   options: Intl.DateTimeFormatOptions
+ ): Intl.DateTimeFormat {
+-  const key = `${tag}:${Object.keys(options).sort().join(",")}`;
++  // The calendar is chosen by the user (KMS patch 0004), so it is part of the key.
++  const calendar = getIntlCalendar();
++  const key = `${tag}:${calendar}:${Object.keys(options).sort().join(",")}`;
+   let formatter = formatters.get(key);
+   if (!formatter) {
+-    formatter = new Intl.DateTimeFormat(tag, options);
++    formatter = new Intl.DateTimeFormat(tag, { calendar, ...options });
+     formatters.set(key, formatter);
+   }
+   return formatter;
+@@ -501,7 +550,8 @@ export function dateToReadable(
+   }
+ 
+   const tag = languageTag(language);
+-  const options = isSameYear(date, new Date()) ? dateOptions : yearOptions;
++  const options = isSameCalendarYear(date, new Date())
++    ? dateOptions : yearOptions;
+ 
+   if (!hasTimeComponent(iso)) {
+     return dateFormatter(tag, options).format(date);

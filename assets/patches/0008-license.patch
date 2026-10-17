@@ -1,0 +1,1947 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 08/18] feat: license, trial and read-only mode, signature card
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001..0007)
+
+(was 0013 v1.1 and the license part of 0014 v1.2)
+- Activation code: JSON signed with the vendor's Ed25519 key and encrypted to
+  this server's X25519 key, bound to the installation ID, server key and
+  hardware hashes (2 identifiers must match); written by the installer to
+  /etc/kms-license (read-only mount), applied licenses kept in
+  /var/lib/kms-license.
+- Trial: 7 days from the first admin sign-in (kept in /var/lib/kms-license;
+  the installer keeps a copy), with a notice after each sign-in.
+- Without a valid license or trial (ended, expired, invalid, clock set back)
+  the workspace is read-only: one gate in the policy check (cancan) denies
+  every non-read action; reading, export, stars, subscriptions and the
+  user's own account stay. Sign-in is not affected. Development checkouts
+  are not limited.
+- API: license.info (all users), license.request (admin: encrypted, signed
+  renewal request file), license.apply (admin).
+- After sign-in a notice with one OK button when the license ends soon or
+  the system is read-only; a status pill links to Settings > License.
+- Settings > License: customer, status, serial, validity (user's calendar
+  and digits), installation details for admins, download request, apply
+  license by paste or file.
+- Trial message: "This system has not been activated yet. You can use it
+  for N more days."
+- Under every license message a signature card: "With many thanks", Seyed
+  Mostafa Ziaei, e-mail ziaei@mail.ir and phone +98 992 696 9774 with icons
+  (mail and phone links), accent bar on the start side.
+
+Files (14; N = new, M = modified, D = deleted):
+  M app/components/AuthenticatedLayout.tsx
+  N app/components/LicenseNotice.tsx
+  M app/hooks/useSettingsConfig.ts
+  N app/scenes/Settings/License.tsx
+  M app/stores/AuthStore.ts
+  N app/utils/license.ts
+  N server/license/format.ts
+  N server/license/gate.ts
+  N server/license/state.ts
+  M server/policies/cancan.ts
+  M server/routes/api/index.ts
+  N server/routes/api/license/index.ts
+  N server/routes/api/license/license.ts
+  N server/routes/api/license/schema.ts
+
+---
+---
+
+diff --git a/app/components/AuthenticatedLayout.tsx b/app/components/AuthenticatedLayout.tsx
+index d1b3ef2..7c78098 100644
+--- a/app/components/AuthenticatedLayout.tsx
++++ b/app/components/AuthenticatedLayout.tsx
+@@ -27,6 +27,7 @@ import {
+ import { DocumentContextProvider } from "./DocumentContext";
+ import Fade from "./Fade";
+ import NotificationBadge from "./NotificationBadge";
++import LicenseNotice from "./LicenseNotice";
+ import { PortalContext } from "./Portal";
+ import CommandBar from "./CommandBar";
+ 
+@@ -119,6 +120,7 @@ const AuthenticatedLayout: React.FC<Props> = ({ children }: Props) => {
+               {children}
+               <CommandBar />
+               <NotificationBadge />
++              <LicenseNotice />
+             </Layout>
+           </DndProvider>
+         </PortalContext.Provider>
+diff --git a/app/components/LicenseNotice.tsx b/app/components/LicenseNotice.tsx
+new file mode 100644
+index 0000000..2acee1d
+--- /dev/null
++++ b/app/components/LicenseNotice.tsx
+@@ -0,0 +1,301 @@
++/**
++ * The license notice after signing in (one OK button) and the small status
++ * pill shown while the license ends soon or the workspace is read-only.
++ *
++ * VERSION: 1.3 (2026-10-12) — KMS patch 0008; 1.3 = shorter trial text, signature card
++ */
++import type { TFunction } from "i18next";
++import { observer } from "mobx-react";
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import { EmailIcon } from "outline-icons";
++import { Link } from "react-router-dom";
++import styled from "styled-components";
++import { depths, s } from "@shared/styles";
++import Button from "~/components/Button";
++import Flex from "~/components/Flex";
++import Text from "~/components/Text";
++import useCurrentUser from "~/hooks/useCurrentUser";
++import useStores from "~/hooks/useStores";
++import useUserCalendar from "~/hooks/useUserCalendar";
++import useUserDateFormat from "~/hooks/useUserDateFormat";
++import {
++  LICENSE_NOTICE_KEY,
++  fetchLicense,
++  formatLicenseDate,
++  formatLicenseNumber,
++  licenseState,
++  type LicenseInfo,
++} from "~/utils/license";
++import { settingsPath } from "~/utils/routeHelpers";
++
++/** How long an acknowledged notice stays quiet within one session. */
++const ACK_VALID_MS = 12 * 60 * 60 * 1000;
++
++/** Path of Settings → License. */
++export const licenseSettingsPath = () => settingsPath("license");
++
++/**
++ * The sentence describing the license state, or undefined when all is well.
++ *
++ * @param info The license information.
++ * @param t The translation function.
++ * @param date The formatted expiry date.
++ * @param days The formatted number of days left.
++ * @returns The message.
++ */
++export function licenseMessage(
++  info: LicenseInfo,
++  t: TFunction,
++  date: string,
++  days: string
++) {
++  switch (info.status) {
++    case "active":
++      return undefined;
++    case "warning":
++      return t(
++        "The license of this system ends in {{ days }} days, on {{ date }}.",
++        { days, date }
++      );
++    case "trial":
++      return t(
++        "This system has not been activated yet. You can use it for {{ days }} more days.",
++        { days }
++      );
++    case "trialEnded":
++      return t(
++        "The trial period ended on {{ date }}. The system is read-only until it is activated.",
++        { date }
++      );
++    case "expired":
++      return t(
++        "The license of this system ended on {{ date }}. The system is read-only until the license is renewed.",
++        { date }
++      );
++    case "missing":
++    case "unconfigured":
++      return t(
++        "This system has not been activated yet and is read-only until a license is applied."
++      );
++    case "clock":
++      return t(
++        "The system clock is earlier than expected, so the license cannot be checked. The system is read-only."
++      );
++    case "notYetValid":
++      return t("The license of this system is not valid yet. The system is read-only.");
++    default:
++      return t("The license of this system is not valid. The system is read-only.");
++  }
++}
++
++/** The supplier's thanks and contact, shown under every license message. */
++export function LicenseSignature() {
++  const { t } = useTranslation();
++  return (
++    <Signature>
++      <Thanks>{t("With many thanks")}</Thanks>
++      <SignatureName>{t("Seyed Mostafa Ziaei")}</SignatureName>
++      <div>
++        <Contact href="mailto:ziaei@mail.ir" dir="ltr">
++          <EmailIcon size={18} />
++          ziaei@mail.ir
++        </Contact>
++      </div>
++      <div>
++        <Contact href="tel:+989926969774" dir="ltr">
++          <PhoneGlyph />
++          +98 992 696 9774
++        </Contact>
++      </div>
++    </Signature>
++  );
++}
++
++function PhoneGlyph() {
++  return (
++    <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
++      <path
++        fill="currentColor"
++        d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z"
++      />
++    </svg>
++  );
++}
++
++function NoticeDialog({
++  message,
++  isAdmin,
++  onOk,
++}: {
++  message: string;
++  isAdmin: boolean;
++  onOk: () => void;
++}) {
++  const { t } = useTranslation();
++  return (
++    <Flex column gap={12}>
++      <Text as="p">{message}</Text>
++      <LicenseSignature />
++      {isAdmin && (
++        <Text as="p" type="secondary" size="small">
++          {t(
++            "To renew or activate it, open Settings → License, download the request file and send it to your supplier."
++          )}
++        </Text>
++      )}
++      <Flex justify="flex-end">
++        <Button onClick={onOk} autoFocus>
++          {t("OK")}
++        </Button>
++      </Flex>
++    </Flex>
++  );
++}
++
++function LicenseNotice() {
++  const { t } = useTranslation();
++  const { dialogs } = useStores();
++  const user = useCurrentUser();
++  const calendar = useUserCalendar();
++  const dateFormat = useUserDateFormat();
++  const info = licenseState.info;
++
++  React.useEffect(() => {
++    void fetchLicense();
++    // Once an hour, so the pill appears when the license ends during a session.
++    const timer = setInterval(() => void fetchLicense(), 60 * 60 * 1000);
++    return () => clearInterval(timer);
++  }, []);
++
++  const date = formatLicenseDate(info?.expiresAt, {
++    language: user.language,
++    calendar,
++    dateFormat,
++  });
++  const days = formatLicenseNumber(Math.max(0, info?.daysLeft ?? 0), user.language);
++  const message = info ? licenseMessage(info, t, date, days) : undefined;
++
++  // Shown once after signing in (the acknowledgement is removed on logout, and
++  // expires after 12 hours for sessions that end without one) and again when
++  // the status changes.
++  React.useEffect(() => {
++    if (!info || !message) {
++      return;
++    }
++    const ackValue = `${user.id}|${info.status}|${info.expiresAt ?? ""}`;
++    let acknowledged: { value?: string; at?: number } = {};
++    try {
++      acknowledged = JSON.parse(localStorage.getItem(LICENSE_NOTICE_KEY) || "{}");
++    } catch {
++      acknowledged = {};
++    }
++    if (
++      acknowledged.value === ackValue &&
++      Date.now() - (acknowledged.at ?? 0) < ACK_VALID_MS
++    ) {
++      return;
++    }
++    const ok = () => {
++      try {
++        localStorage.setItem(
++          LICENSE_NOTICE_KEY,
++          JSON.stringify({ value: ackValue, at: Date.now() })
++        );
++      } catch {
++        // storage unavailable: the notice shows again next time
++      }
++      dialogs.closeAllModals();
++    };
++    dialogs.openModal({
++      title: t("License"),
++      content: (
++        <NoticeDialog message={message} isAdmin={user.isAdmin} onOk={ok} />
++      ),
++      onClose: ok,
++    });
++  }, [info, message, user.id, user.isAdmin, dialogs, t]);
++
++  if (!info || info.status === "active") {
++    return null;
++  }
++
++  return (
++    <Pill
++      to={licenseSettingsPath()}
++      $danger={info.readOnly}
++      title={message}
++      aria-label={message}
++    >
++      {info.readOnly
++        ? t("Read-only · license")
++        : info.status === "trial"
++          ? t("Trial: {{ days }} days left", { days })
++          : t("License: {{ days }} days left", { days })}
++    </Pill>
++  );
++}
++
++const Pill = styled(Link)<{ $danger: boolean }>`
++  position: fixed;
++  bottom: 12px;
++  inset-inline-end: 16px;
++  z-index: ${depths.toc};
++  padding: 4px 12px;
++  border-radius: 14px;
++  font-size: 13px;
++  font-weight: 500;
++  color: ${(props) => (props.$danger ? props.theme.white : props.theme.text)};
++  background: ${(props) =>
++    props.$danger ? props.theme.danger : props.theme.warning};
++  box-shadow: ${s("menuShadow")};
++  text-decoration: none;
++
++  &:hover {
++    opacity: 0.9;
++  }
++
++  @media print {
++    display: none;
++  }
++`;
++
++const Signature = styled.div`
++  margin-top: 4px;
++  padding: 10px 14px;
++  border-radius: 8px;
++  border-inline-start: 3px solid ${s("accent")};
++  background: ${s("backgroundSecondary")};
++  font-size: 14px;
++  line-height: 1.7;
++`;
++
++const Thanks = styled.div`
++  color: ${s("textSecondary")};
++  font-size: 13px;
++`;
++
++const SignatureName = styled.div`
++  font-weight: 600;
++  margin-bottom: 2px;
++`;
++
++const Contact = styled.a`
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  color: ${s("textSecondary")};
++  text-decoration: none;
++
++  svg {
++    flex-shrink: 0;
++    color: ${s("accent")};
++    fill: currentColor;
++  }
++
++  &:hover {
++    color: ${s("accent")};
++  }
++`;
++
++export default observer(LicenseNotice);
+diff --git a/app/hooks/useSettingsConfig.ts b/app/hooks/useSettingsConfig.ts
+index 39b9462..15cc262 100644
+--- a/app/hooks/useSettingsConfig.ts
++++ b/app/hooks/useSettingsConfig.ts
+@@ -49,6 +49,7 @@ const Shares = lazy(() => import("~/scenes/Settings/Shares"));
+ const Templates = lazy(() => import("~/scenes/Settings/Templates"));
+ const CustomEmojis = lazy(() => import("~/scenes/Settings/CustomEmojis"));
+ const Embeds = lazy(() => import("~/scenes/Settings/Embeds"));
++const License = lazy(() => import("~/scenes/Settings/License"));
+ 
+ export type ConfigItem = {
+   name: string;
+@@ -117,6 +118,16 @@ const useSettingsConfig = () => {
+         icon: PadlockIcon,
+       },
+       // Workspace
++      {
++        // KMS patch 0008: visible to everyone, renewal is for admins.
++        name: t("License"),
++        path: settingsPath("license"),
++        component: License.Component,
++        preload: License.preload,
++        enabled: true,
++        group: t("Workspace"),
++        icon: ShieldIcon,
++      },
+       {
+         name: t("Details"),
+         path: settingsPath("details"),
+diff --git a/app/scenes/Settings/License.tsx b/app/scenes/Settings/License.tsx
+new file mode 100644
+index 0000000..5b963a0
+--- /dev/null
++++ b/app/scenes/Settings/License.tsx
+@@ -0,0 +1,258 @@
++/**
++ * Settings → License: the customer and the validity of the license for every
++ * user; for admins the renewal request download and applying a new license.
++ *
++ * VERSION: 1.2 (2026-10-12) — KMS patch 0008; 1.2 = signature under the message
++ */
++import { observer } from "mobx-react";
++import { DownloadIcon, ShieldIcon } from "outline-icons";
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import { toast } from "sonner";
++import styled from "styled-components";
++import { s } from "@shared/styles";
++import Button from "~/components/Button";
++import Flex from "~/components/Flex";
++import Heading from "~/components/Heading";
++import Input from "~/components/Input";
++import Scene from "~/components/Scene";
++import Text from "~/components/Text";
++import { LicenseSignature, licenseMessage } from "~/components/LicenseNotice";
++import useCurrentUser from "~/hooks/useCurrentUser";
++import useStores from "~/hooks/useStores";
++import useUserCalendar from "~/hooks/useUserCalendar";
++import useUserDateFormat from "~/hooks/useUserDateFormat";
++import { client } from "~/utils/ApiClient";
++import { download } from "~/utils/download";
++import {
++  fetchLicense,
++  formatLicenseDate,
++  formatLicenseNumber,
++  licenseState,
++  licenseStatusLabel,
++  type LicenseInfo,
++} from "~/utils/license";
++import SettingRow from "./components/SettingRow";
++
++
++function AppliedDialog({ message, onOk }: { message: string; onOk: () => void }) {
++  const { t } = useTranslation();
++  return (
++    <Flex column gap={12}>
++      <Text as="p">{message}</Text>
++      <Flex justify="flex-end">
++        <Button onClick={onOk} autoFocus>
++          {t("OK")}
++        </Button>
++      </Flex>
++    </Flex>
++  );
++}
++
++function License() {
++  const { t } = useTranslation();
++  const { dialogs } = useStores();
++  const user = useCurrentUser();
++  const calendar = useUserCalendar();
++  const dateFormat = useUserDateFormat();
++  const info = licenseState.info;
++  const [text, setText] = React.useState("");
++  const [isApplying, setApplying] = React.useState(false);
++  const [isRequesting, setRequesting] = React.useState(false);
++  const fileRef = React.useRef<HTMLInputElement>(null);
++
++  React.useEffect(() => {
++    void fetchLicense();
++  }, []);
++
++  const fmtDate = (iso?: string) =>
++    formatLicenseDate(iso, { language: user.language, calendar, dateFormat });
++  const fmtNumber = (value: number) => formatLicenseNumber(value, user.language);
++
++  const handleRequest = React.useCallback(async () => {
++    setRequesting(true);
++    try {
++      const res = await client.post("/license.request");
++      download(res.data.text, res.data.fileName, "text/plain");
++      toast.success(t("Request file downloaded. Send it to your supplier."));
++    } catch (err) {
++      toast.error((err as Error).message);
++    } finally {
++      setRequesting(false);
++    }
++  }, [t]);
++
++  const handleFile = React.useCallback(
++    async (ev: React.ChangeEvent<HTMLInputElement>) => {
++      const file = ev.target.files?.[0];
++      if (file) {
++        setText(await file.text());
++      }
++      ev.target.value = "";
++    },
++    []
++  );
++
++  const handleApply = React.useCallback(async () => {
++    setApplying(true);
++    try {
++      const res = await client.post("/license.apply", { license: text.trim() });
++      const applied = res.data as LicenseInfo;
++      setText("");
++      const message = t("Your license is active until {{ date }}.", {
++        date: formatLicenseDate(applied.expiresAt, {
++          language: user.language,
++          calendar,
++          dateFormat,
++        }),
++      });
++      // Permissions change with the license, so the app is reloaded after OK.
++      const ok = () => {
++        dialogs.closeAllModals();
++        window.location.reload();
++      };
++      dialogs.openModal({
++        title: t("License"),
++        content: <AppliedDialog message={message} onOk={ok} />,
++        onClose: ok,
++      });
++    } catch (err) {
++      toast.error((err as Error).message);
++    } finally {
++      setApplying(false);
++    }
++  }, [text, t, dialogs, user.language, calendar, dateFormat]);
++
++  const message =
++    info &&
++    licenseMessage(
++      info,
++      t,
++      fmtDate(info.expiresAt),
++      fmtNumber(Math.max(0, info.daysLeft ?? 0))
++    );
++
++  return (
++    <Scene title={t("License")} icon={<ShieldIcon />}>
++      <Heading>{t("License")}</Heading>
++      {message && (
++        <Banner $danger={!!info?.readOnly}>
++          <Text as="p">{message}</Text>
++          <LicenseSignature />
++        </Banner>
++      )}
++
++      <SettingRow name="kms-license-customer" label={t("Customer")}>
++        <Text as="span" selectable>
++          {info?.customer ?? "—"}
++        </Text>
++      </SettingRow>
++      <SettingRow name="kms-license-status" label={t("Status")}>
++        <Text as="span" type={info?.readOnly ? "danger" : undefined}>
++          {info ? licenseStatusLabel(info.status, t) : "…"}
++          {info?.readOnly ? ` · ${t("Read-only")}` : ""}
++        </Text>
++      </SettingRow>
++      <SettingRow name="kms-license-serial" label={t("Serial number")}>
++        <Text as="span" selectable dir="ltr">
++          {info?.serial ?? "—"}
++        </Text>
++      </SettingRow>
++      <SettingRow name="kms-license-from" label={t("Valid from")}>
++        <Text as="span">{fmtDate(info?.notBefore)}</Text>
++      </SettingRow>
++      <SettingRow name="kms-license-until" label={t("Valid until")}>
++        <Text as="span">
++          {fmtDate(info?.expiresAt)}
++          {info?.daysLeft !== undefined && info.daysLeft > 0
++            ? ` (${t("{{ days }} days left", { days: fmtNumber(info.daysLeft) })})`
++            : ""}
++        </Text>
++      </SettingRow>
++
++      {user.isAdmin ? (
++        <>
++          <SettingRow
++            name="kms-license-install"
++            label={t("Installation ID")}
++            description={
++              info?.reason
++                ? `${t("Details")}: ${info.reason}`
++                : info?.hardware
++                  ? t("Hardware: {{ matching }} of {{ required }} identifiers match", {
++                      matching: fmtNumber(info.hardware.matching),
++                      required: fmtNumber(info.hardware.required),
++                    })
++                  : undefined
++            }
++          >
++            <Text as="span" selectable dir="ltr" size="small">
++              {info?.installId ?? "—"}
++            </Text>
++          </SettingRow>
++
++          <Heading as="h2">{t("Renew or activate")}</Heading>
++          <Text as="p" type="secondary">
++            {t(
++              "Download the request file and send it to your supplier. It is encrypted and contains this server's identity. You will receive an activation code to apply below."
++            )}
++          </Text>
++          <Button
++            icon={<DownloadIcon />}
++            onClick={handleRequest}
++            disabled={isRequesting}
++            neutral
++          >
++            {t("Download license request")}
++          </Button>
++
++          <Heading as="h2">{t("Apply license")}</Heading>
++          <Input
++            type="textarea"
++            label={t("Activation code")}
++            placeholder="-----BEGIN KMS ACTIVATION-----"
++            value={text}
++            onChange={(ev) => setText(ev.target.value)}
++            dir="ltr"
++            rows={6}
++            flex
++          />
++          <Flex gap={8}>
++            <Button
++              onClick={handleApply}
++              disabled={isApplying || !text.includes("KMS ACTIVATION")}
++            >
++              {isApplying ? `${t("Applying")}…` : t("Apply license")}
++            </Button>
++            <Button neutral onClick={() => fileRef.current?.click()}>
++              {t("Open activation file")}
++            </Button>
++            <input
++              ref={fileRef}
++              type="file"
++              accept=".kmslic,.txt,text/plain"
++              onChange={handleFile}
++              hidden
++            />
++          </Flex>
++        </>
++      ) : (
++        <Text as="p" type="secondary">
++          {t("Only an admin can renew the license.")}
++        </Text>
++      )}
++
++    </Scene>
++  );
++}
++
++const Banner = styled.div<{ $danger: boolean }>`
++  margin: 8px 0 16px;
++  padding: 8px 12px;
++  border-radius: 6px;
++  border-inline-start: 4px solid
++    ${(props) => (props.$danger ? props.theme.danger : props.theme.warning)};
++  background: ${s("backgroundSecondary")};
++`;
++
++export default observer(License);
+diff --git a/app/stores/AuthStore.ts b/app/stores/AuthStore.ts
+index 6b7e301..1734a43 100644
+--- a/app/stores/AuthStore.ts
++++ b/app/stores/AuthStore.ts
+@@ -349,6 +349,13 @@ export default class AuthStore extends Store<Team> {
+     savePath?: boolean;
+     userInitiated?: boolean;
+   }) => {
++    // The license notice is shown again after the next sign-in (KMS patch 0008).
++    try {
++      localStorage.removeItem("kms.license.notice");
++    } catch {
++      // storage unavailable
++    }
++
+     // if this logout was forced from an authenticated route then
+     // save the current path so we can go back there once signed in
+     if (savePath) {
+diff --git a/app/utils/license.ts b/app/utils/license.ts
+new file mode 100644
+index 0000000..6b5d536
+--- /dev/null
++++ b/app/utils/license.ts
+@@ -0,0 +1,152 @@
++/**
++ * Client side of the KMS license: the current state (shared by the notice,
++ * the status pill and Settings → License) and display helpers.
++ *
++ * VERSION: 1.1 (2026-10-12) — KMS patch 0008
++ */
++import type { TFunction } from "i18next";
++import { observable, runInAction } from "mobx";
++import type { CalendarType, DateFormatType } from "@shared/types";
++import { dateLocale, formatDate, unicodeCLDRtoBCP47 } from "@shared/utils/date";
++import { client } from "~/utils/ApiClient";
++
++export type LicenseStatus =
++  | "active"
++  | "warning"
++  | "trial"
++  | "trialEnded"
++  | "expired"
++  | "notYetValid"
++  | "missing"
++  | "invalid"
++  | "clock"
++  | "unconfigured";
++
++export type LicenseInfo = {
++  status: LicenseStatus;
++  readOnly: boolean;
++  customer?: string;
++  serial?: string;
++  issuedAt?: string;
++  notBefore?: string;
++  expiresAt?: string;
++  daysLeft?: number;
++  warnDays: number;
++  trialDays: number;
++  installId?: string;
++  reason?: string;
++  hardware?: { matching: number; required: number };
++  /** Set once, when this request started the trial period. */
++  trialStarted?: boolean;
++};
++
++/** localStorage key of the acknowledged login notice; cleared on logout. */
++export const LICENSE_NOTICE_KEY = "kms.license.notice";
++
++export const licenseState = observable({
++  info: undefined as LicenseInfo | undefined,
++  loading: false,
++});
++
++/**
++ * Load (or reload) the license information.
++ *
++ * @returns The license information, or undefined when it cannot be loaded.
++ */
++export async function fetchLicense(): Promise<LicenseInfo | undefined> {
++  runInAction(() => {
++    licenseState.loading = true;
++  });
++  try {
++    const res = await client.post("/license.info");
++    const info = res.data as LicenseInfo;
++    if (info.trialStarted) {
++      // Permissions were sent as read-only before the trial started: reload once.
++      window.location.reload();
++      return info;
++    }
++    runInAction(() => {
++      licenseState.info = info;
++    });
++    return info;
++  } catch {
++    return undefined;
++  } finally {
++    runInAction(() => {
++      licenseState.loading = false;
++    });
++  }
++}
++
++/**
++ * Format a license date with the user's calendar (Persian digits in fa).
++ *
++ * @param iso The ISO date.
++ * @param options The user's language, calendar and date format.
++ * @returns The formatted date.
++ */
++export function formatLicenseDate(
++  iso: string | undefined,
++  options: {
++    language?: string;
++    calendar: CalendarType;
++    dateFormat: DateFormatType;
++  }
++) {
++  if (!iso) {
++    return "—";
++  }
++  return formatDate(new Date(iso), "MMMM do, yyyy", {
++    locale: dateLocale(options.language as Parameters<typeof dateLocale>[0]),
++    calendar: options.calendar,
++    dateFormat: options.dateFormat,
++  });
++}
++
++/**
++ * Format a number for the user's language (Persian digits in fa).
++ *
++ * @param value The number.
++ * @param language The user's language (e.g. fa_IR).
++ * @returns The formatted number.
++ */
++export function formatLicenseNumber(value: number, language?: string) {
++  try {
++    return new Intl.NumberFormat(unicodeCLDRtoBCP47(language || "en_US")).format(
++      value
++    );
++  } catch {
++    return String(value);
++  }
++}
++
++/**
++ * The status as a short label.
++ *
++ * @param status The license status.
++ * @param t The translation function.
++ * @returns The label.
++ */
++export function licenseStatusLabel(status: LicenseStatus, t: TFunction) {
++  switch (status) {
++    case "active":
++      return t("Active");
++    case "warning":
++      return t("Ending soon");
++    case "trial":
++      return t("Trial");
++    case "trialEnded":
++      return t("Trial ended");
++    case "expired":
++      return t("Expired");
++    case "notYetValid":
++      return t("Not valid yet");
++    case "missing":
++    case "unconfigured":
++      return t("Not activated");
++    case "clock":
++      return t("System clock problem");
++    default:
++      return t("Not valid");
++  }
++}
+diff --git a/server/license/format.ts b/server/license/format.ts
+new file mode 100644
+index 0000000..8cbc53b
+--- /dev/null
++++ b/server/license/format.ts
+@@ -0,0 +1,367 @@
++/**
++ * KMS license formats and cryptography (node:crypto only).
++ *
++ * - A license (activation code) is a JSON payload signed with the vendor's
++ *   Ed25519 key and then encrypted to this server's X25519 key, so only this
++ *   server can read it: "-----BEGIN KMS ACTIVATION-----".
++ * - A renewal request is a JSON payload signed with this server's Ed25519 key
++ *   and encrypted to the vendor's X25519 key: "-----BEGIN KMS LICENSE REQUEST-----".
++ * Both use ECDH (X25519) + HKDF-SHA256 + AES-256-GCM. The vendor tool
++ * (kms-license.mjs) uses the same constants.
++ *
++ * VERSION: 1.1 (2026-10-12) — KMS patch 0008
++ */
++import {
++  createCipheriv,
++  createDecipheriv,
++  createHash,
++  createPrivateKey,
++  createPublicKey,
++  diffieHellman,
++  generateKeyPairSync,
++  hkdfSync,
++  randomBytes,
++  sign,
++  verify,
++  type KeyObject,
++} from "node:crypto";
++
++export const LICENSE_TYPE = "kms-license";
++export const REQUEST_TYPE = "kms-license-request";
++export const PRODUCT = "kms-outline";
++export const LICENSE_ARMOR = "KMS ACTIVATION";
++export const REQUEST_ARMOR = "KMS LICENSE REQUEST";
++const REQUEST_HKDF_INFO = "kms-license-request-v1";
++const LICENSE_HKDF_INFO = "kms-license-v2";
++
++/** Hashes of the hardware identifiers; raw values never leave the server. */
++export type HardwareComponents = Record<string, string>;
++
++export type LicensePayload = {
++  type: typeof LICENSE_TYPE;
++  v: 1;
++  product: string;
++  serial: string;
++  customer: string;
++  installId: string;
++  /** sha256 (hex) of the server's public key (SPKI DER). */
++  serverKey: string;
++  hw: HardwareComponents;
++  issuedAt: string;
++  notBefore: string;
++  expiresAt: string;
++  warnDays?: number;
++  note?: string;
++};
++
++export type RequestPayload = {
++  type: typeof REQUEST_TYPE;
++  v: 1;
++  product: string;
++  createdAt: string;
++  installId: string;
++  serverKey: string;
++  serverPublicKey: string;
++  /** This server's X25519 public key (base64url, raw); licenses are encrypted to it. */
++  serverBoxKey: string;
++  hw: HardwareComponents;
++  organization?: string;
++  admin?: { name?: string; email?: string };
++  current?: {
++    serial: string;
++    customer: string;
++    expiresAt: string;
++  } | null;
++  appVersion?: string;
++};
++
++export type VendorPublicKeys = {
++  v: 1;
++  product: string;
++  sign: JsonWebKey;
++  box: JsonWebKey;
++};
++
++export const b64u = (buf: Buffer) => buf.toString("base64url");
++export const fromB64u = (text: string) => Buffer.from(text, "base64url");
++
++/**
++ * Wrap text in an armor block, 64 characters per line.
++ *
++ * @param label The armor label.
++ * @param body The body text.
++ * @returns The armored text.
++ */
++export function armor(label: string, body: string) {
++  const lines = body.match(/.{1,64}/g) ?? [];
++  return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
++}
++
++/**
++ * Extract the body of an armor block (whitespace removed).
++ *
++ * @param label The armor label.
++ * @param text The armored text.
++ * @returns The body, or undefined when the block is missing.
++ */
++export function unarmor(label: string, text: string) {
++  const re = new RegExp(
++    `-----BEGIN ${label}-----([\\s\\S]*?)-----END ${label}-----`
++  );
++  const match = re.exec(text);
++  return match ? match[1].replace(/\s+/g, "") : undefined;
++}
++
++/**
++ * sha256 (hex) of a public key in SPKI DER form.
++ *
++ * @param key The public key.
++ * @returns The fingerprint.
++ */
++export function keyFingerprint(key: KeyObject) {
++  return createHash("sha256")
++    .update(key.export({ type: "spki", format: "der" }))
++    .digest("hex");
++}
++
++/**
++ * Load the vendor's public keys.
++ *
++ * @param json The parsed vendor-public.json.
++ * @returns The signing (Ed25519) and box (X25519) public keys.
++ */
++export function loadVendorKeys(json: VendorPublicKeys) {
++  if (!json?.sign?.x || !json?.box?.x) {
++    throw new Error("vendor public key file is incomplete");
++  }
++  return {
++    sign: createPublicKey({
++      key: { kty: "OKP", crv: "Ed25519", x: json.sign.x },
++      format: "jwk",
++    }),
++    box: createPublicKey({
++      key: { kty: "OKP", crv: "X25519", x: json.box.x },
++      format: "jwk",
++    }),
++  };
++}
++
++/**
++ * The raw (32 byte) form of an X25519 public key.
++ *
++ * @param key The public key.
++ * @returns The raw key.
++ */
++export const rawX25519 = (key: KeyObject) =>
++  fromB64u(key.export({ format: "jwk" }).x as string);
++
++/**
++ * An X25519 public key from its raw base64url form.
++ *
++ * @param x The raw key, base64url.
++ * @returns The public key.
++ */
++export const x25519FromRaw = (x: string) =>
++  createPublicKey({ key: { kty: "OKP", crv: "X25519", x }, format: "jwk" });
++
++/**
++ * Encrypt to an X25519 public key (ephemeral ECDH, HKDF-SHA256, AES-256-GCM).
++ *
++ * @param plain The plaintext.
++ * @param recipient The recipient's X25519 public key.
++ * @param info The HKDF info string (separates the two uses).
++ * @returns The base64url envelope.
++ */
++export function boxSeal(plain: Buffer, recipient: KeyObject, info: string) {
++  const eph = generateKeyPairSync("x25519");
++  const epk = rawX25519(eph.publicKey);
++  const rpk = rawX25519(recipient);
++  const shared = diffieHellman({ privateKey: eph.privateKey, publicKey: recipient });
++  const key = Buffer.from(
++    hkdfSync("sha256", shared, Buffer.concat([epk, rpk]), info, 32)
++  );
++  const iv = randomBytes(12);
++  const cipher = createCipheriv("aes-256-gcm", key, iv);
++  const ct = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
++  return b64u(
++    Buffer.from(
++      JSON.stringify({
++        v: 1,
++        alg: "X25519-HKDF-SHA256-A256GCM",
++        epk: b64u(epk),
++        iv: b64u(iv),
++        ct: b64u(ct),
++      }),
++      "utf8"
++    )
++  );
++}
++
++/**
++ * Decrypt a boxSeal envelope.
++ *
++ * @param body The base64url envelope.
++ * @param recipientPrivate The recipient's X25519 private key.
++ * @param info The HKDF info string.
++ * @returns The plaintext.
++ * @throws When the envelope was made for another key or was changed.
++ */
++export function boxOpen(body: string, recipientPrivate: KeyObject, info: string) {
++  const env = JSON.parse(fromB64u(body).toString("utf8"));
++  if (env.v !== 1 || env.alg !== "X25519-HKDF-SHA256-A256GCM") {
++    throw new Error("unsupported envelope");
++  }
++  const epk = fromB64u(env.epk);
++  const rpk = rawX25519(createPublicKey(recipientPrivate));
++  const shared = diffieHellman({
++    privateKey: recipientPrivate,
++    publicKey: x25519FromRaw(env.epk),
++  });
++  const key = Buffer.from(
++    hkdfSync("sha256", shared, Buffer.concat([epk, rpk]), info, 32)
++  );
++  const ct = fromB64u(env.ct);
++  try {
++    const decipher = createDecipheriv("aes-256-gcm", key, fromB64u(env.iv));
++    decipher.setAuthTag(ct.subarray(ct.length - 16));
++    return Buffer.concat([
++      decipher.update(ct.subarray(0, ct.length - 16)),
++      decipher.final(),
++    ]);
++  } catch {
++    throw new Error("it was made for another server, or it was changed");
++  }
++}
++
++/**
++ * Sign a license with the vendor key and encrypt it for one server (used by
++ * tests; the vendor tool has its own copy).
++ *
++ * @param payload The license payload.
++ * @param vendorSignPrivate The vendor's Ed25519 private key.
++ * @param serverBox The server's X25519 public key.
++ * @returns The armored activation code.
++ */
++export function sealLicense(
++  payload: LicensePayload,
++  vendorSignPrivate: KeyObject,
++  serverBox: KeyObject
++) {
++  const bytes = Buffer.from(JSON.stringify(payload), "utf8");
++  const plain = Buffer.from(
++    JSON.stringify({ p: b64u(bytes), s: b64u(sign(null, bytes, vendorSignPrivate)) }),
++    "utf8"
++  );
++  return armor(LICENSE_ARMOR, boxSeal(plain, serverBox, LICENSE_HKDF_INFO));
++}
++
++/**
++ * Decrypt a license with this server's key and verify the vendor signature.
++ *
++ * @param text The armored activation code.
++ * @param serverBoxPrivate This server's X25519 private key.
++ * @param vendorSign The vendor's Ed25519 public key.
++ * @returns The verified payload.
++ * @throws When the code is not for this server, was changed, or is not signed by the vendor.
++ */
++export function openLicense(
++  text: string,
++  serverBoxPrivate: KeyObject,
++  vendorSign: KeyObject
++) {
++  const body = unarmor(LICENSE_ARMOR, text);
++  if (!body) {
++    throw new Error("not a KMS activation code");
++  }
++  let plain: Buffer;
++  try {
++    plain = boxOpen(body, serverBoxPrivate, LICENSE_HKDF_INFO);
++  } catch (err) {
++    throw new Error(`the activation code cannot be opened: ${(err as Error).message}`);
++  }
++  const { p, s } = JSON.parse(plain.toString("utf8"));
++  const bytes = fromB64u(p);
++  if (!verify(null, bytes, vendorSign, fromB64u(s))) {
++    throw new Error("the activation code is not signed by the vendor");
++  }
++  const payload = JSON.parse(bytes.toString("utf8")) as LicensePayload;
++  if (payload.type !== LICENSE_TYPE || payload.v !== 1) {
++    throw new Error("unsupported license version");
++  }
++  return payload;
++}
++
++/**
++ * Sign a request with the server key and encrypt it for the vendor.
++ *
++ * @param payload The request payload.
++ * @param serverPrivateKey The server's Ed25519 private key.
++ * @param vendorBox The vendor's X25519 public key.
++ * @returns The armored request text.
++ */
++export function sealRequest(
++  payload: RequestPayload,
++  serverPrivateKey: KeyObject,
++  vendorBox: KeyObject
++) {
++  const inner = Buffer.from(JSON.stringify(payload), "utf8");
++  const plain = Buffer.from(
++    JSON.stringify({
++      inner: b64u(inner),
++      sig: b64u(sign(null, inner, serverPrivateKey)),
++    }),
++    "utf8"
++  );
++  return armor(REQUEST_ARMOR, boxSeal(plain, vendorBox, REQUEST_HKDF_INFO));
++}
++
++/**
++ * Decrypt and verify a request (used by tests; the vendor tool has its own copy).
++ *
++ * @param text The armored request.
++ * @param vendorBoxPrivate The vendor's X25519 private key.
++ * @returns The verified request payload.
++ */
++export function openRequest(text: string, vendorBoxPrivate: KeyObject) {
++  const body = unarmor(REQUEST_ARMOR, text);
++  if (!body) {
++    throw new Error("not a KMS license request");
++  }
++  const plain = boxOpen(body, vendorBoxPrivate, REQUEST_HKDF_INFO);
++  const { inner, sig } = JSON.parse(plain.toString("utf8"));
++  const innerBytes = fromB64u(inner);
++  const payload = JSON.parse(innerBytes.toString("utf8")) as RequestPayload;
++  const serverPublic = createPublicKey(payload.serverPublicKey);
++  if (!verify(null, innerBytes, serverPublic, fromB64u(sig))) {
++    throw new Error("the request signature is not valid");
++  }
++  if (keyFingerprint(serverPublic) !== payload.serverKey) {
++    throw new Error("the request's server key does not match its fingerprint");
++  }
++  return payload;
++}
++
++/**
++ * Count matching hardware components.
++ *
++ * @param licensed Components named in the license.
++ * @param local Components of this server.
++ * @returns Matching and required counts.
++ */
++export function matchHardware(
++  licensed: HardwareComponents,
++  local: HardwareComponents
++) {
++  const names = Object.keys(licensed).filter((n) => !!licensed[n]);
++  const matching = names.filter((n) => local[n] === licensed[n]).length;
++  const required = Math.min(2, names.length);
++  return { matching, required, ok: names.length > 0 && matching >= required };
++}
++
++/**
++ * Load a PEM private key.
++ *
++ * @param pem The PEM text.
++ * @returns The key.
++ */
++export const privateKeyFromPem = (pem: string) => createPrivateKey(pem);
+diff --git a/server/license/gate.ts b/server/license/gate.ts
+new file mode 100644
+index 0000000..23314d4
+--- /dev/null
++++ b/server/license/gate.ts
+@@ -0,0 +1,61 @@
++/**
++ * What stays allowed while the license makes the workspace read-only:
++ * reading, downloading and exporting, personal stars and subscriptions, and
++ * the user's own account (profile, preferences, notifications, passkeys).
++ *
++ * VERSION: 1.0 (2026-10-12) — KMS patch 0008
++ */
++
++const READ_ACTIONS = new Set([
++  "read",
++  "readDocument",
++  "readDetails",
++  "readEmail",
++  "readReaction",
++  "readTemplate",
++  "listUsers",
++  "listViews",
++  "listRevisions",
++  "listApiKeys",
++  "download",
++  "export",
++  "audit",
++  "star",
++  "unstar",
++  "subscribe",
++  "unsubscribe",
++  "createUserPasskey",
++]);
++
++/** Models the user owns personally; changes to them are not workspace content. */
++const PERSONAL_MODELS = new Set(["Notification", "UserPasskey"]);
++
++/**
++ * Whether an action is allowed while the workspace is read-only.
++ *
++ * @param performerId The id of the user performing the action.
++ * @param action The policy action.
++ * @param targetClass The class name of the target model, if any.
++ * @param targetId The id of the target model, if any.
++ * @returns true when the action does not change workspace content.
++ */
++export function allowedWhileReadOnly(
++  performerId: string | undefined,
++  action: string,
++  targetClass: string | undefined,
++  targetId: string | undefined
++) {
++  if (READ_ACTIONS.has(action)) {
++    return true;
++  }
++  if (targetClass && PERSONAL_MODELS.has(targetClass)) {
++    return true;
++  }
++  // The user's own profile and preferences.
++  return (
++    targetClass === "User" &&
++    !!performerId &&
++    performerId === targetId &&
++    action === "update"
++  );
++}
+diff --git a/server/license/state.ts b/server/license/state.ts
+new file mode 100644
+index 0000000..1a645ec
+--- /dev/null
++++ b/server/license/state.ts
+@@ -0,0 +1,480 @@
++/**
++ * The license of this server: loading, status, the trial period, renewal
++ * requests and applying a new activation code. Without a valid license or a
++ * running trial the workspace is read-only (see server/policies/cancan.ts);
++ * signing in always works.
++ *
++ * Files written by the installer (read-only in the container):
++ *   $KMS_LICENSE_CONFIG_DIR (/etc/kms-license): install.json, server-key.pem,
++ *   server-pub.pem, server-box.pem, hardware.json
++ * Files written by the app:
++ *   $KMS_LICENSE_DATA_DIR (/var/lib/kms-license): license.kmslic, state.json
++ * The vendor's public keys are part of the build:
++ *   $KMS_LICENSE_VENDOR_KEY (<app>/kms-license/vendor-public.json)
++ *
++ * VERSION: 1.1 (2026-10-12) — KMS patch 0008
++ */
++import { createHash, createPublicKey, type KeyObject } from "node:crypto";
++import fs from "node:fs";
++import path from "node:path";
++import {
++  PRODUCT,
++  REQUEST_TYPE,
++  b64u,
++  keyFingerprint,
++  loadVendorKeys,
++  matchHardware,
++  openLicense,
++  privateKeyFromPem,
++  rawX25519,
++  sealRequest,
++  type HardwareComponents,
++  type LicensePayload,
++  type RequestPayload,
++} from "./format";
++
++export type LicenseStatus =
++  | "active"
++  | "warning"
++  | "trial"
++  | "trialEnded"
++  | "expired"
++  | "notYetValid"
++  | "missing"
++  | "invalid"
++  | "clock"
++  | "unconfigured";
++
++export type LicenseInfo = {
++  status: LicenseStatus;
++  /** Whether the workspace is read-only because of the license. */
++  readOnly: boolean;
++  customer?: string;
++  serial?: string;
++  issuedAt?: string;
++  notBefore?: string;
++  /** End of the license, or of the trial period. */
++  expiresAt?: string;
++  /** Whole days until the license (or trial) ends; negative once it ended. */
++  daysLeft?: number;
++  warnDays: number;
++  trialDays: number;
++  installId?: string;
++  /** Why the license is not valid, in English (the client translates the status). */
++  reason?: string;
++  hardware?: { matching: number; required: number };
++};
++
++const DAY = 24 * 60 * 60 * 1000;
++const DEFAULT_WARN_DAYS = 30;
++/** Days the system can be used before it is activated, from the first admin sign-in. */
++export const TRIAL_DAYS = 7;
++const RECHECK_MS = 60 * 1000;
++const CLOCK_TOLERANCE_MS = DAY;
++const LAST_SEEN_STEP_MS = 60 * 60 * 1000;
++
++const configDir = () =>
++  process.env.KMS_LICENSE_CONFIG_DIR || "/etc/kms-license";
++const dataDir = () => process.env.KMS_LICENSE_DATA_DIR || "/var/lib/kms-license";
++const vendorKeyPath = () =>
++  process.env.KMS_LICENSE_VENDOR_KEY ||
++  path.resolve(process.cwd(), "kms-license", "vendor-public.json");
++const hostMachineIdPath = () =>
++  process.env.KMS_LICENSE_HOST_MACHINE_ID || "/etc/kms-host-machine-id";
++const licensePath = () => path.join(dataDir(), "license.kmslic");
++const statePath = () => path.join(dataDir(), "state.json");
++
++/** Same hash as the installer: sha256("kms-hw-v1|<name>|<value>"). */
++export const hardwareHash = (name: string, value: string) =>
++  createHash("sha256").update(`kms-hw-v1|${name}|${value.trim()}`).digest("hex");
++
++const readJson = <T>(file: string): T | undefined => {
++  try {
++    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
++  } catch {
++    return undefined;
++  }
++};
++
++type State = { lastSeen?: string; trialStartedAt?: string };
++
++const readState = (): State => readJson<State>(statePath()) ?? {};
++
++/**
++ * Update state.json, keeping the other fields.
++ *
++ * @param change The fields to set.
++ * @returns Whether the file could be written.
++ */
++function writeState(change: State) {
++  try {
++    fs.mkdirSync(dataDir(), { recursive: true });
++    const next = { ...readState(), ...change };
++    const tmp = `${statePath()}.tmp`;
++    fs.writeFileSync(tmp, JSON.stringify(next) + "\n");
++    fs.renameSync(tmp, statePath());
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++type ServerIdentity = {
++  installId: string;
++  serverKey: string;
++  serverPublicKeyPem: string;
++  boxPrivate: KeyObject;
++  boxPublicRaw: string;
++  hw: HardwareComponents;
++};
++
++/**
++ * Read the identity the installer created for this server.
++ *
++ * @returns The identity, or undefined when the installer files are missing.
++ */
++function loadIdentity(): ServerIdentity | undefined {
++  const dir = configDir();
++  const install = readJson<{ installId?: string }>(path.join(dir, "install.json"));
++  const hardware = readJson<{ components?: HardwareComponents }>(
++    path.join(dir, "hardware.json")
++  );
++  let pem: string;
++  let boxPem: string;
++  try {
++    pem = fs.readFileSync(path.join(dir, "server-pub.pem"), "utf8");
++    boxPem = fs.readFileSync(path.join(dir, "server-box.pem"), "utf8");
++  } catch {
++    return undefined;
++  }
++  if (!install?.installId || !hardware?.components) {
++    return undefined;
++  }
++  const hw = { ...hardware.components };
++  // The host's machine-id is mounted into the container: a hardware.json copied
++  // from another server is caught here even without running the installer.
++  try {
++    const machineId = fs.readFileSync(hostMachineIdPath(), "utf8");
++    if (machineId.trim()) {
++      hw.machineid = hardwareHash("machineid", machineId);
++    }
++  } catch {
++    // not mounted: hardware.json alone is used
++  }
++  const boxPrivate = privateKeyFromPem(boxPem);
++  return {
++    installId: install.installId,
++    serverKey: keyFingerprint(createPublicKey(pem)),
++    serverPublicKeyPem: pem,
++    boxPrivate,
++    boxPublicRaw: b64u(rawX25519(createPublicKey(boxPrivate))),
++    hw,
++  };
++}
++
++/**
++ * Check a verified license against this server.
++ *
++ * @param payload The license payload.
++ * @param identity This server's identity.
++ * @returns An error message, or undefined when the license is for this server.
++ */
++function bindingError(payload: LicensePayload, identity: ServerIdentity) {
++  if (payload.product !== PRODUCT) {
++    return `the license is for another product (${payload.product})`;
++  }
++  if (payload.installId !== identity.installId) {
++    return "the license is for another installation";
++  }
++  if (payload.serverKey !== identity.serverKey) {
++    return "the license is for another server key";
++  }
++  const hw = matchHardware(payload.hw ?? {}, identity.hw);
++  if (!hw.ok) {
++    return `the hardware does not match (${hw.matching} of ${hw.required} required identifiers)`;
++  }
++  return undefined;
++}
++
++/**
++ * Detect a clock set back: the last time seen is kept in state.json.
++ *
++ * @param now The current time.
++ * @returns Whether the clock is earlier than a time already seen.
++ */
++function clockWasSetBack(now: number) {
++  const state = readState();
++  const lastSeen = state.lastSeen ? Date.parse(state.lastSeen) : 0;
++  if (lastSeen && now < lastSeen - CLOCK_TOLERANCE_MS) {
++    return true;
++  }
++  if (!lastSeen || now > lastSeen + LAST_SEEN_STEP_MS) {
++    writeState({ lastSeen: new Date(now).toISOString() });
++  }
++  return false;
++}
++
++/**
++ * The status while no license is applied: trial, trial ended, or not started.
++ *
++ * @param now The current time.
++ * @param base Fields shared by every status.
++ * @returns The license information.
++ */
++function trialInfo(now: number, base: LicenseInfo): LicenseInfo {
++  const started = readState().trialStartedAt;
++  if (!started) {
++    return {
++      ...base,
++      status: "missing",
++      readOnly: true,
++      reason: "no license has been applied and the trial has not started",
++    };
++  }
++  const end = Date.parse(started) + TRIAL_DAYS * DAY;
++  const info: LicenseInfo = {
++    ...base,
++    status: "trial",
++    readOnly: false,
++    notBefore: started,
++    expiresAt: new Date(end).toISOString(),
++    daysLeft: Math.ceil((end - now) / DAY),
++  };
++  if (clockWasSetBack(now)) {
++    return {
++      ...info,
++      status: "clock",
++      readOnly: true,
++      reason: "the system clock is earlier than a time already seen",
++    };
++  }
++  if (now >= end) {
++    return { ...info, status: "trialEnded", readOnly: true };
++  }
++  return info;
++}
++
++/**
++ * Compute the license status from the files.
++ *
++ * @returns The license information.
++ */
++function compute(): LicenseInfo {
++  const now = Date.now();
++  const base: LicenseInfo = {
++    status: "missing",
++    readOnly: true,
++    warnDays: DEFAULT_WARN_DAYS,
++    trialDays: TRIAL_DAYS,
++  };
++  const identity = loadIdentity();
++  const vendorJson = readJson<Parameters<typeof loadVendorKeys>[0]>(vendorKeyPath());
++  if (!identity || !vendorJson) {
++    // A development checkout has no installer files and is not limited.
++    return {
++      ...base,
++      status: "unconfigured",
++      readOnly: process.env.NODE_ENV === "production",
++      reason: !identity
++        ? `installer license files are missing in ${configDir()}`
++        : `vendor public key is missing (${vendorKeyPath()})`,
++    };
++  }
++  base.installId = identity.installId;
++  let text: string;
++  try {
++    text = fs.readFileSync(licensePath(), "utf8");
++  } catch {
++    return trialInfo(now, base);
++  }
++  let payload: LicensePayload;
++  try {
++    payload = openLicense(text, identity.boxPrivate, loadVendorKeys(vendorJson).sign);
++  } catch (err) {
++    return {
++      ...base,
++      status: "invalid",
++      readOnly: true,
++      reason: (err as Error).message,
++    };
++  }
++  const info: LicenseInfo = {
++    ...base,
++    status: "active",
++    readOnly: false,
++    customer: payload.customer,
++    serial: payload.serial,
++    issuedAt: payload.issuedAt,
++    notBefore: payload.notBefore,
++    expiresAt: payload.expiresAt,
++    warnDays: payload.warnDays ?? DEFAULT_WARN_DAYS,
++    hardware: (({ matching, required }) => ({ matching, required }))(
++      matchHardware(payload.hw ?? {}, identity.hw)
++    ),
++  };
++  const error = bindingError(payload, identity);
++  if (error) {
++    return { ...info, status: "invalid", readOnly: true, reason: error };
++  }
++  if (clockWasSetBack(now)) {
++    return {
++      ...info,
++      status: "clock",
++      readOnly: true,
++      reason: "the system clock is earlier than a time already seen",
++    };
++  }
++  const expires = Date.parse(payload.expiresAt);
++  info.daysLeft = Math.ceil((expires - now) / DAY);
++  if (now < Date.parse(payload.notBefore)) {
++    return { ...info, status: "notYetValid", readOnly: true };
++  }
++  if (now >= expires) {
++    return { ...info, status: "expired", readOnly: true };
++  }
++  if (info.daysLeft <= info.warnDays) {
++    info.status = "warning";
++  }
++  return info;
++}
++
++let cached: LicenseInfo | undefined;
++let cachedAt = 0;
++
++/**
++ * The license information, recomputed at most once a minute.
++ *
++ * @param force Recompute now.
++ * @returns The license information.
++ */
++export function getLicenseInfo(force = false): LicenseInfo {
++  const now = Date.now();
++  if (!force && cached && now - cachedAt < RECHECK_MS) {
++    return cached;
++  }
++  try {
++    cached = compute();
++  } catch (err) {
++    cached = {
++      status: "invalid",
++      readOnly: true,
++      warnDays: DEFAULT_WARN_DAYS,
++      trialDays: TRIAL_DAYS,
++      reason: (err as Error).message,
++    };
++  }
++  cachedAt = now;
++  return cached;
++}
++
++/**
++ * Whether the workspace is read-only because of the license. Called for every
++ * policy check, so it only reads the cached state.
++ *
++ * @returns true when changes are not allowed.
++ */
++export function isLicenseReadOnly() {
++  return getLicenseInfo().readOnly;
++}
++
++/**
++ * Start the trial period on the first admin sign-in, when no license is
++ * applied and no trial was started before.
++ *
++ * @returns true when the trial was started now.
++ */
++export function startTrialIfNeeded() {
++  const info = getLicenseInfo(true);
++  if (info.status !== "missing" || readState().trialStartedAt) {
++    return false;
++  }
++  if (!writeState({ trialStartedAt: new Date().toISOString() })) {
++    return false;
++  }
++  getLicenseInfo(true);
++  return true;
++}
++
++/**
++ * Build the encrypted renewal / activation request for the vendor.
++ *
++ * @param meta Details shown to the vendor.
++ * @returns The armored request and a suggested file name.
++ */
++export function createLicenseRequest(meta: {
++  organization?: string;
++  adminName?: string;
++  adminEmail?: string;
++  appVersion?: string;
++}) {
++  const identity = loadIdentity();
++  const vendorJson = readJson<Parameters<typeof loadVendorKeys>[0]>(vendorKeyPath());
++  if (!identity || !vendorJson) {
++    throw new Error("the installer license files or the vendor key are missing");
++  }
++  const privatePem = fs.readFileSync(path.join(configDir(), "server-key.pem"), "utf8");
++  const info = getLicenseInfo(true);
++  const payload: RequestPayload = {
++    type: REQUEST_TYPE,
++    v: 1,
++    product: PRODUCT,
++    createdAt: new Date().toISOString(),
++    installId: identity.installId,
++    serverKey: identity.serverKey,
++    serverPublicKey: identity.serverPublicKeyPem,
++    serverBoxKey: identity.boxPublicRaw,
++    hw: identity.hw,
++    organization: meta.organization,
++    admin: { name: meta.adminName, email: meta.adminEmail },
++    current:
++      info.serial && info.customer && info.expiresAt
++        ? { serial: info.serial, customer: info.customer, expiresAt: info.expiresAt }
++        : null,
++    appVersion: meta.appVersion,
++  };
++  const text = sealRequest(
++    payload,
++    privateKeyFromPem(privatePem),
++    loadVendorKeys(vendorJson).box
++  );
++  const slug =
++    (meta.organization || "kms")
++      .toLowerCase()
++      .replace(/[^a-z0-9]+/g, "-")
++      .replace(/^-|-$/g, "")
++      .slice(0, 40) || "kms";
++  const date = payload.createdAt.slice(0, 10);
++  return { text, fileName: `kms-license-request-${slug}-${date}.kmsreq` };
++}
++
++/**
++ * Open an activation code with this server's key, check it and store it.
++ *
++ * @param text The armored activation code.
++ * @returns The new license information.
++ * @throws When the code is not for this server or already expired.
++ */
++export function applyLicense(text: string): LicenseInfo {
++  const identity = loadIdentity();
++  const vendorJson = readJson<Parameters<typeof loadVendorKeys>[0]>(vendorKeyPath());
++  if (!identity || !vendorJson) {
++    throw new Error("the installer license files or the vendor key are missing");
++  }
++  const payload = openLicense(text, identity.boxPrivate, loadVendorKeys(vendorJson).sign);
++  const error = bindingError(payload, identity);
++  if (error) {
++    throw new Error(error);
++  }
++  if (Date.parse(payload.expiresAt) <= Date.now()) {
++    throw new Error("this license has already expired");
++  }
++  fs.mkdirSync(dataDir(), { recursive: true });
++  const target = licensePath();
++  if (fs.existsSync(target)) {
++    fs.copyFileSync(target, `${target}.bak-${Date.now()}`);
++  }
++  const tmp = `${target}.tmp`;
++  fs.writeFileSync(tmp, text.trim() + "\n", { mode: 0o640 });
++  fs.renameSync(tmp, target);
++  return getLicenseInfo(true);
++}
+diff --git a/server/policies/cancan.ts b/server/policies/cancan.ts
+index 5ff49e2..8302146 100644
+--- a/server/policies/cancan.ts
++++ b/server/policies/cancan.ts
+@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
+ import { isPlainObject } from "es-toolkit/compat";
+ import type { Model } from "sequelize-typescript";
+ import { AuthorizationError } from "@server/errors";
++import { allowedWhileReadOnly } from "@server/license/gate";
++import { isLicenseReadOnly } from "@server/license/state";
+ 
+ // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- variance requires `any` to accept arbitrary constructors
+ type Constructor = new (...args: any[]) => unknown;
+@@ -280,6 +282,19 @@ export class CanCan {
+     target: Model | null | undefined,
+     options: object
+   ) => {
++    // Without a valid license the workspace is read-only (KMS patch 0008).
++    if (
++      isLicenseReadOnly() &&
++      !allowedWhileReadOnly(
++        (performer as { id?: string }).id,
++        action,
++        this.unscopedClass(target ?? null)?.name,
++        (target as { id?: string } | null | undefined)?.id
++      )
++    ) {
++      return false;
++    }
++
+     const matchingAbilities = this.getMatchingAbilities(
+       performer,
+       action,
+diff --git a/server/routes/api/index.ts b/server/routes/api/index.ts
+index 484c785..d4201c4 100644
+--- a/server/routes/api/index.ts
++++ b/server/routes/api/index.ts
+@@ -32,6 +32,7 @@ import groups from "./groups";
+ import imports from "./imports";
+ import installation from "./installation";
+ import integrations from "./integrations";
++import license from "./license";
+ import apiErrorHandler from "./middlewares/apiErrorHandler";
+ import apiResponse from "./middlewares/apiResponse";
+ import editor from "./middlewares/editor";
+@@ -124,6 +125,7 @@ router.use("/", userMemberships.routes());
+ router.use("/", reactions.routes());
+ router.use("/", relationships.routes());
+ router.use("/", imports.routes());
++router.use("/", license.routes());
+ 
+ if (!env.isCloudHosted) {
+   router.use("/", installation.routes());
+diff --git a/server/routes/api/license/index.ts b/server/routes/api/license/index.ts
+new file mode 100644
+index 0000000..c1c6f25
+--- /dev/null
++++ b/server/routes/api/license/index.ts
+@@ -0,0 +1,2 @@
++// VERSION: 1.0 (2026-10-12) — KMS patch 0008
++export { default } from "./license";
+diff --git a/server/routes/api/license/license.ts b/server/routes/api/license/license.ts
+new file mode 100644
+index 0000000..a5db390
+--- /dev/null
++++ b/server/routes/api/license/license.ts
+@@ -0,0 +1,82 @@
++/**
++ * license.info, license.request and license.apply. These work while the
++ * workspace is read-only, so an expired server can always be renewed.
++ *
++ * VERSION: 1.1 (2026-10-12) — KMS patch 0008
++ */
++import Router from "@koa/router";
++import { UserRole } from "@shared/types";
++import { ValidationError } from "@server/errors";
++import {
++  applyLicense,
++  createLicenseRequest,
++  getLicenseInfo,
++  startTrialIfNeeded,
++  type LicenseInfo,
++} from "@server/license/state";
++import auth from "@server/middlewares/authentication";
++import validate from "@server/middlewares/validate";
++import type { APIContext } from "@server/types";
++import { getVersion } from "@server/utils/getInstallationInfo";
++import * as T from "./schema";
++
++const router = new Router();
++
++/**
++ * The license information a user may see; admins also get the technical
++ * details needed for support.
++ *
++ * @param info The full license information.
++ * @param isAdmin Whether the user is an admin.
++ * @returns The presented information.
++ */
++const present = (info: LicenseInfo, isAdmin: boolean) => {
++  const { installId, reason, hardware, ...publicInfo } = info;
++  return isAdmin ? { ...publicInfo, installId, reason, hardware } : publicInfo;
++};
++
++router.post("license.info", auth(), async (ctx: APIContext) => {
++  const { user } = ctx.state.auth;
++  const isAdmin = user.role === UserRole.Admin;
++  // The trial period starts with the first admin sign-in.
++  const trialStarted = isAdmin && startTrialIfNeeded();
++  ctx.body = {
++    data: { ...present(getLicenseInfo(), isAdmin), trialStarted },
++  };
++});
++
++router.post(
++  "license.request",
++  auth({ role: UserRole.Admin }),
++  async (ctx: APIContext) => {
++    const { user } = ctx.state.auth;
++    const team = user.team;
++    try {
++      const { text, fileName } = createLicenseRequest({
++        organization: team?.name,
++        adminName: user.name,
++        adminEmail: user.email ?? undefined,
++        appVersion: getVersion(),
++      });
++      ctx.body = { data: { text, fileName } };
++    } catch (err) {
++      throw ValidationError((err as Error).message);
++    }
++  }
++);
++
++router.post(
++  "license.apply",
++  auth({ role: UserRole.Admin }),
++  validate(T.LicenseApplySchema),
++  async (ctx: APIContext<T.LicenseApplyReq>) => {
++    const { license } = ctx.input.body;
++    try {
++      ctx.body = { data: present(applyLicense(license), true) };
++    } catch (err) {
++      throw ValidationError((err as Error).message);
++    }
++  }
++);
++
++export default router;
+diff --git a/server/routes/api/license/schema.ts b/server/routes/api/license/schema.ts
+new file mode 100644
+index 0000000..a5e9ff9
+--- /dev/null
++++ b/server/routes/api/license/schema.ts
+@@ -0,0 +1,14 @@
++/**
++ * VERSION: 1.1 (2026-10-12) — KMS patch 0008
++ */
++import { z } from "zod";
++import { BaseSchema } from "@server/routes/api/schema";
++
++export const LicenseApplySchema = BaseSchema.extend({
++  body: z.object({
++    /** The armored activation code sent by the vendor. */
++    license: z.string().min(16).max(20000),
++  }),
++});
++
++export type LicenseApplyReq = z.infer<typeof LicenseApplySchema>;

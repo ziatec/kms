@@ -1,0 +1,880 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 03/18] feat(editor): list numbers follow the list direction, number style
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001..0002)
+
+(was 0006 v2.0)
+- Each list (numbered, bulleted, checklist) is laid out in the direction of
+  its own first item with text: the item's explicit direction, or else its
+  first strong character (ListDirection extension sets the list's dir).
+  Replaces the upstream :has(p:dir(rtl)) rule. Logical margins/padding.
+- Numbers: Persian digits in right-to-left lists (every level), Western
+  digits in left-to-right ones (nested left-to-right lists keep a. / i.).
+- Number style 1. / 1) / 1- (Persian digits in RTL lists): "Number style"
+  menu in the formatting toolbar (setListStyle), or typed at the start of a
+  line. Defined with @counter-style in index.html. Markdown keeps "1)";
+  "1-" is written as "1.".
+- Static HTML without the editor falls back to the first paragraph of the
+  first item for direction and digits.
+- The number takes the font and size of the item's text (::marker rule).
+- The html lang attribute follows the user language, also after a change.
+
+Files (12; N = new, M = modified, D = deleted):
+  N app/components/Icons/ListStyleIcon.tsx
+  M app/editor/menus/formatting.tsx
+  M app/utils/i18n.ts
+  M app/utils/language.ts
+  M server/static/index.html
+  M shared/editor/components/Styles.ts
+  N shared/editor/extensions/ListDirection.ts
+  N shared/editor/nodes/OrderedList.test.ts
+  M shared/editor/nodes/OrderedList.ts
+  M shared/editor/nodes/index.ts
+  N shared/editor/queries/getListDirection.test.ts
+  N shared/editor/queries/getListDirection.ts
+
+---
+---
+
+diff --git a/app/components/Icons/ListStyleIcon.tsx b/app/components/Icons/ListStyleIcon.tsx
+new file mode 100644
+index 0000000..275a840
+--- /dev/null
++++ b/app/components/Icons/ListStyleIcon.tsx
+@@ -0,0 +1,36 @@
++type Props = {
++  /** The number and suffix shown, e.g. "1)" or "۱-". */
++  label: string;
++  /** The direction of the list, so the suffix is placed as in the text. */
++  dir?: "rtl" | "ltr";
++  /** The size of the icon, 24px is default to match standard icons. */
++  size?: number;
++  /** The color of the icon, defaults to the current text color. */
++  color?: string;
++};
++
++/**
++ * An icon showing a list number with its suffix, for the number style menu.
++ */
++export default function ListStyleIcon({
++  label,
++  dir = "ltr",
++  size = 24,
++  color = "currentColor",
++}: Props) {
++  return (
++    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden>
++      <text
++        x="12"
++        y="16.5"
++        textAnchor="middle"
++        fontSize="12"
++        fontWeight="600"
++        fill={color}
++        direction={dir}
++      >
++        {label}
++      </text>
++    </svg>
++  );
++}
+diff --git a/app/editor/menus/formatting.tsx b/app/editor/menus/formatting.tsx
+index c577818..072e260 100644
+--- a/app/editor/menus/formatting.tsx
++++ b/app/editor/menus/formatting.tsx
+@@ -53,6 +53,12 @@ import TableCell from "@shared/editor/nodes/TableCell";
+ import Highlight from "@shared/editor/marks/Highlight";
+ import { DottedCircleIcon } from "~/components/Icons/DottedCircleIcon";
+ import TextDirectionIcon from "~/components/Icons/TextDirectionIcon";
++import ListStyleIcon from "~/components/Icons/ListStyleIcon";
++import {
++  findOrderedList,
++  getListDirection,
++  isListStyleActive,
++} from "@shared/editor/queries/getListDirection";
+ import TextAlignIcon from "~/components/Icons/TextAlignIcon";
+ import TextStyleIcon from "~/components/Icons/TextStyleIcon";
+ import { getTextStyle } from "@shared/editor/queries/getTextStyle";
+@@ -106,6 +112,21 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+   const selectedCellsColorSet = getColorSetForSelectedCells(state.selection);
+   const canFormat = !isInCodeBlock;
+   const textDirection = getTextDirection(state);
++  const orderedList = findOrderedList(state);
++  const listDir = orderedList
++    ? (getListDirection(orderedList.node) ??
++      (document.documentElement.dir === "rtl" ? "rtl" : "ltr"))
++    : "ltr";
++  const one = listDir === "rtl" ? "۱" : "1";
++  const numberStyles: { listStyle: string; suffix: string }[] = [
++    { listStyle: "number", suffix: "." },
++    { listStyle: "number-paren", suffix: ")" },
++    { listStyle: "number-dash", suffix: "-" },
++  ];
++  const currentSuffix =
++    numberStyles.find(
++      (style) => style.listStyle === orderedList?.node.attrs.listStyle
++    )?.suffix ?? ".";
+   const textAlignment = getTextAlignment(state);
+   const textStyle = getTextStyle(state);
+ 
+@@ -209,6 +230,22 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+       active: isListActive(schema.nodes.ordered_list),
+       visible: !isInCodeBlock && !isTableCell,
+     },
++    {
++      // Number style of the numbered list around the cursor: 1. / 1) / 1-,
++      // shown with Persian digits when the list is right-to-left.
++      group: MenuItemGroup.block,
++      tooltip: t("Number style"),
++      icon: <ListStyleIcon label={one + currentSuffix} dir={listDir} />,
++      visible: !!orderedList && !isInCodeBlock,
++      children: (): MenuItem[] =>
++        numberStyles.map(({ listStyle, suffix }) => ({
++          name: "setListStyle",
++          label: one + suffix,
++          icon: <ListStyleIcon label={one + suffix} dir={listDir} />,
++          active: isListStyleActive(listStyle),
++          attrs: { listStyle },
++        })),
++    },
+     {
+       name: "outdentList",
+       group: MenuItemGroup.block,
+diff --git a/app/utils/i18n.ts b/app/utils/i18n.ts
+index d20fe80..28bc2b1 100644
+--- a/app/utils/i18n.ts
++++ b/app/utils/i18n.ts
+@@ -22,6 +22,7 @@ export function initI18n(defaultLanguage = "en_US") {
+     document.documentElement.dir = isRTLLanguage(defaultLanguage)
+       ? "rtl"
+       : "ltr";
++    document.documentElement.lang = lng;
+   }
+ 
+   void i18n
+diff --git a/app/utils/language.ts b/app/utils/language.ts
+index b541810..fa33654 100644
+--- a/app/utils/language.ts
++++ b/app/utils/language.ts
+@@ -47,5 +47,8 @@ export async function changeLanguage(
+ 
+   if (typeof document !== "undefined") {
+     document.documentElement.dir = isRTLLanguage(locale) ? "rtl" : "ltr";
++    if (localeBCP) {
++      document.documentElement.lang = localeBCP;
++    }
+   }
+ }
+diff --git a/server/static/index.html b/server/static/index.html
+index 1f8f96a..c872ee9 100644
+--- a/server/static/index.html
++++ b/server/static/index.html
+@@ -170,6 +170,27 @@
+         src: url("{cdn-url}/fonts/Parastoo-Bold.woff2") format("woff2");
+       }
+ 
++      /* Numbered list styles "1)" and "1-", with Western or Persian digits. */
++      @counter-style decimal-paren {
++        system: extends decimal;
++        suffix: ") ";
++      }
++
++      @counter-style decimal-dash {
++        system: extends decimal;
++        suffix: "- ";
++      }
++
++      @counter-style persian-paren {
++        system: extends persian;
++        suffix: ") ";
++      }
++
++      @counter-style persian-dash {
++        system: extends persian;
++        suffix: "- ";
++      }
++
+       body,
+       html {
+         margin: 0;
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index d03584f..44d5077 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -1503,20 +1503,66 @@ a:hover {
+   text-decoration: ${props.readOnly ? "underline" : "none"};
+ }
+ 
++/* Each list is laid out in the direction of its own first item: the
++   ListDirection extension sets its dir attribute. The numbers or bullets are
++   on the right of a right-to-left list and on the left of a left-to-right
++   one, whatever the direction of the page or of nested lists, and the
++   logical margin and padding put the indent on the side of the markers. */
+ ul,
+ ol {
+-  margin: 0 0.1em 0 ${props.staticHTML ? "0" : "-26px"};
+-  padding: 0 0 0 48px;
+-
+-  &:has(p:dir(rtl)) {
++  margin-block: 0;
++  margin-inline: ${props.staticHTML ? "0" : "-26px"} 0.1em;
++  padding-block: 0;
++  padding-inline: 48px 0;
++
++  /* Without the editor (static HTML) no dir attribute is set: follow the
++     first paragraph of the first item (directly or in a checklist item). */
++  &:not([dir]):has(> li:first-child > p:first-child:dir(rtl)),
++  &:not([dir]):has(> li:first-child > div > p:first-child:dir(rtl)) {
+     direction: rtl;
+   }
++}
+ 
+-  &:has(p:dir(rtl)),
+-  &:dir(rtl) {
+-    margin: 0 ${props.staticHTML ? "0" : "-26px"} 0 0.1em;
+-    padding: 0 48px 0 0;
+-  }
++/* Numbers follow the direction of their list: Western digits in a
++   left-to-right list, Persian digits in a right-to-left one, at every level.
++   The left-to-right rule is inside :where(), which adds no specificity, so
++   nested left-to-right lists keep their letters and numerals (below). The
++   selectors start with "ol": styled-components attaches a selector that
++   starts with ":" to the editor container itself. The "1)" and "1-" styles
++   are defined in index.html; alphabetical lists keep their inline style.
++   :dir() follows dir attributes, so static HTML without them repeats the
++   first-item test of the list rule above. */
++ol:where(:dir(ltr)) {
++  list-style-type: decimal;
++}
++
++ol:dir(rtl),
++ol:not([dir]):has(> li:first-child > p:first-child:dir(rtl)) {
++  list-style-type: persian;
++}
++
++ol[data-list-style="number-paren"]:dir(ltr) {
++  list-style-type: decimal-paren;
++}
++
++ol[data-list-style="number-paren"]:dir(rtl),
++ol[data-list-style="number-paren"]:not([dir]):has(> li:first-child > p:first-child:dir(rtl)) {
++  list-style-type: persian-paren;
++}
++
++ol[data-list-style="number-dash"]:dir(ltr) {
++  list-style-type: decimal-dash;
++}
++
++ol[data-list-style="number-dash"]:dir(rtl),
++ol[data-list-style="number-dash"]:not([dir]):has(> li:first-child > p:first-child:dir(rtl)) {
++  list-style-type: persian-dash;
++}
++
++/* The number follows the font and size of the item's text. */
++ol > li[data-marker-style]::marker {
++  font-family: var(--marker-font);
++  font-size: var(--marker-size);
+ }
+ 
+ ol ol {
+@@ -1597,26 +1643,16 @@ th .${EditorStyleHelper.checklistCompletedToggle} {
+   display: none;
+ }
+ 
++/* Laid out in the direction of the list's first item (dir attribute set by
++   the ListDirection extension), like the other lists. */
+ ul.checkbox_list {
+   padding: 0;
+-  margin-left: -24px;
+-  margin-right: 0;
++  margin-inline: -24px 0;
+ 
+   & > li {
+     display: flex;
+     list-style: none;
+-    padding-left: 24px;
+-    padding-right: 0;
+-  }
+-
+-  &:has(p:dir(rtl)) {
+-    margin-left: 0;
+-    margin-right: -24px;
+-
+-    & > li {
+-      padding-left: 0;
+-      padding-right: 24px;
+-    }
++    padding-inline: 24px 0;
+   }
+ }
+ 
+@@ -1641,7 +1677,8 @@ ul.checkbox_list {
+     top: 1px;
+     transition: transform 100ms ease-in-out;
+     opacity: .8;
+-    margin: 0 0.5em 0 0;
++    margin: 0;
++    margin-inline-end: 0.5em;
+ 
+     &[aria-checked=true] {
+       opacity: 1;
+@@ -1705,11 +1742,6 @@ ul.checkbox_list {
+     }
+   }
+ 
+-  &:has(p:dir(rtl)) {
+-    .checkbox {
+-      margin: 0 0 0 0.5em;
+-    }
+-  }
+ }
+ 
+ li p:first-child {
+diff --git a/shared/editor/extensions/ListDirection.ts b/shared/editor/extensions/ListDirection.ts
+new file mode 100644
+index 0000000..6f8a933
+--- /dev/null
++++ b/shared/editor/extensions/ListDirection.ts
+@@ -0,0 +1,61 @@
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import { Plugin, PluginKey } from "prosemirror-state";
++import { Decoration, DecorationSet } from "prosemirror-view";
++import Extension from "../lib/Extension";
++import { getListDirection, listNodeNames } from "../queries/getListDirection";
++
++const pluginKey = new PluginKey<DecorationSet>("listDirection");
++
++/**
++ * Builds decorations that give every list the `dir` attribute of its own
++ * first item with text.
++ *
++ * @param doc the document.
++ * @returns the decorations.
++ */
++function buildDecorations(doc: ProsemirrorNode): DecorationSet {
++  const decorations: Decoration[] = [];
++
++  doc.descendants((node, pos) => {
++    if (node.isTextblock) {
++      return false;
++    }
++    if (listNodeNames.has(node.type.name)) {
++      const dir = getListDirection(node);
++      if (dir) {
++        decorations.push(Decoration.node(pos, pos + node.nodeSize, { dir }));
++      }
++    }
++    return true;
++  });
++
++  return DecorationSet.create(doc, decorations);
++}
++
++/**
++ * Lays out each list in the direction of its own first item, so that the
++ * numbers or bullets of a right-to-left list are on the right and those of a
++ * left-to-right list on the left, whatever the direction of the page, of the
++ * other items or of nested lists. A list without text yet follows the page.
++ */
++export default class ListDirection extends Extension {
++  get name() {
++    return "list_direction";
++  }
++
++  get plugins() {
++    return [
++      new Plugin<DecorationSet>({
++        key: pluginKey,
++        state: {
++          init: (_, state) => buildDecorations(state.doc),
++          apply: (tr, value) =>
++            tr.docChanged ? buildDecorations(tr.doc) : value,
++        },
++        props: {
++          decorations: (state) => pluginKey.getState(state),
++        },
++      }),
++    ];
++  }
++}
+diff --git a/shared/editor/nodes/OrderedList.test.ts b/shared/editor/nodes/OrderedList.test.ts
+new file mode 100644
+index 0000000..f70df32
+--- /dev/null
++++ b/shared/editor/nodes/OrderedList.test.ts
+@@ -0,0 +1,20 @@
++import { findNodes, parser, serializer } from "../../test/editor";
++
++describe("OrderedList", () => {
++  it("reads and writes a list numbered with parentheses", () => {
++    const markdown = "1) one\n2) two";
++    const [list] = findNodes(parser.parse(markdown)?.toJSON(), "ordered_list");
++
++    expect(list?.attrs?.listStyle).toBe("number-paren");
++    expect(serializer.serialize(parser.parse(markdown)).trim()).toBe(markdown);
++  });
++
++  it("keeps lists numbered with periods", () => {
++    const [list] = findNodes(
++      parser.parse("1. one\n2. two")?.toJSON(),
++      "ordered_list"
++    );
++
++    expect(list?.attrs?.listStyle).toBe("number");
++  });
++});
+diff --git a/shared/editor/nodes/OrderedList.ts b/shared/editor/nodes/OrderedList.ts
+index 8bc5943..e430769 100644
+--- a/shared/editor/nodes/OrderedList.ts
++++ b/shared/editor/nodes/OrderedList.ts
+@@ -6,13 +6,153 @@ import type {
+   Schema,
+   Node as ProsemirrorNode,
+ } from "prosemirror-model";
++import type { Command } from "prosemirror-state";
++import { Plugin } from "prosemirror-state";
++import { Decoration, DecorationSet } from "prosemirror-view";
++import { fontFamilies } from "../../utils/textStyle";
+ import toggleList from "../commands/toggleList";
+ import type { MarkdownSerializerState } from "../lib/markdown/serializer";
+ import { listWrappingInputRule } from "../lib/listInputRule";
++import { findOrderedList } from "../queries/getListDirection";
+ import alphaListsRule from "../rules/alphaLists";
+ import Node from "./Node";
+ 
+-const LIST_STYLES = ["number", "lower-alpha", "upper-alpha"];
++const LIST_STYLES = [
++  "number",
++  "number-paren",
++  "number-dash",
++  "lower-alpha",
++  "upper-alpha",
++];
++
++/**
++ * Numbered styles with another suffix than a period: "1)" and "1-". They are
++ * written as a data attribute rather than a list-style-type, as the CSS picks
++ * Persian or Western digits from the direction of the list.
++ */
++const NUMBER_STYLES = ["number-paren", "number-dash"];
++
++/** The number styles offered in the menu: "1.", "1)" and "1-". */
++export const NUMBER_STYLE_CHOICES = ["number", "number-paren", "number-dash"];
++
++/** The suffixes typed after a number to start a list, by list style. */
++const SUFFIX_STYLES: Record<string, string> = {
++  ".": "number",
++  ")": "number-paren",
++  "-": "number-dash",
++};
++
++const persianDigits = "۰۱۲۳۴۵۶۷۸۹";
++const arabicDigits = "٠١٢٣٤٥٦٧٨٩";
++
++/**
++ * Parses a number written in Western, Persian or Arabic-Indic digits.
++ *
++ * @param text the digits, e.g. "12", "۱۲" or "١٢".
++ * @returns the number.
++ */
++function parseDigits(text: string): number {
++  return parseInt(
++    text
++      .replace(/[۰-۹]/g, (digit) => String(persianDigits.indexOf(digit)))
++      .replace(/[٠-٩]/g, (digit) => String(arabicDigits.indexOf(digit))),
++    10
++  );
++}
++
++/**
++ * Sets the number style of the numbered list around the selection.
++ *
++ * @param attrs the command attributes, e.g. `{ listStyle: "number-dash" }`.
++ * @returns the command.
++ */
++function setListStyle(attrs: unknown): Command {
++  return (state, dispatch) => {
++    const listStyle =
++      attrs && typeof attrs === "object" && "listStyle" in attrs
++        ? attrs.listStyle
++        : null;
++    if (
++      typeof listStyle !== "string" ||
++      !NUMBER_STYLE_CHOICES.includes(listStyle)
++    ) {
++      return false;
++    }
++    const list = findOrderedList(state);
++    if (!list) {
++      return false;
++    }
++    if (list.node.attrs.listStyle !== listStyle) {
++      dispatch?.(
++        state.tr.setNodeMarkup(list.pos, undefined, {
++          ...list.node.attrs,
++          listStyle,
++        })
++      );
++    }
++    return true;
++  };
++}
++
++/**
++ * Returns the first text node inside a node.
++ *
++ * @param node the node to search.
++ * @returns the first text node, or null.
++ */
++function firstText(node: ProsemirrorNode): ProsemirrorNode | null {
++  if (node.isText) {
++    return node;
++  }
++  for (let i = 0; i < node.childCount; i++) {
++    const found = firstText(node.child(i));
++    if (found) {
++      return found;
++    }
++  }
++  return null;
++}
++
++/**
++ * Builds decorations that give the number of each list item the font and size
++ * of the item's text, set with the text style mark, through CSS variables read
++ * by the ::marker rule in the editor styles.
++ *
++ * @param doc the document.
++ * @returns the decorations.
++ */
++function buildMarkerDecorations(doc: ProsemirrorNode): DecorationSet {
++  const decorations: Decoration[] = [];
++
++  doc.descendants((node, pos) => {
++    if (node.type.name !== "ordered_list") {
++      return true;
++    }
++    node.forEach((item, offset) => {
++      const from = pos + 1 + offset;
++      const text = item.firstChild ? firstText(item.firstChild) : null;
++      const style = text?.marks.find(
++        (m) => m.type.name === "text_style"
++      )?.attrs;
++      const font = style?.fontFamily ? fontFamilies[style.fontFamily] : null;
++      const size = style?.fontSize;
++      if (font || size) {
++        decorations.push(
++          Decoration.node(from, from + item.nodeSize, {
++            "data-marker-style": "",
++            style: [
++              `--marker-font: ${font ? font.css : "initial"}`,
++              `--marker-size: ${size ? `${size}px` : "initial"}`,
++            ].join("; "),
++          })
++        );
++      }
++    });
++    return true;
++  });
++
++  return DecorationSet.create(doc, decorations);
++}
+ 
+ export default class OrderedList extends Node {
+   get name() {
+@@ -40,16 +180,24 @@ export default class OrderedList extends Node {
+       parseDOM: [
+         {
+           tag: "ol",
+-          getAttrs: (dom: HTMLOListElement) => ({
+-            order: dom.hasAttribute("start")
+-              ? parseInt(dom.getAttribute("start") || "1", 10)
+-              : 1,
+-            listStyle: dom.style.listStyleType,
+-          }),
++          getAttrs: (dom: HTMLOListElement) => {
++            const listStyle =
++              dom.getAttribute("data-list-style") || dom.style.listStyleType;
++            return {
++              order: dom.hasAttribute("start")
++                ? parseInt(dom.getAttribute("start") || "1", 10)
++                : 1,
++              listStyle: LIST_STYLES.includes(listStyle) ? listStyle : "number",
++            };
++          },
+         },
+       ],
+       toDOM: (node) => {
+-        const attrs: { start?: number; style?: string } = {};
++        const attrs: {
++          start?: number;
++          style?: string;
++          "data-list-style"?: string;
++        } = {};
+ 
+         if (node.attrs.order !== 1) {
+           attrs.start = node.attrs.order;
+@@ -57,7 +205,9 @@ export default class OrderedList extends Node {
+ 
+         // The style is written into a declaration, so only a style the editor
+         // renders is emitted.
+-        if (
++        if (NUMBER_STYLES.includes(node.attrs.listStyle)) {
++          attrs["data-list-style"] = node.attrs.listStyle;
++        } else if (
+           node.attrs.listStyle !== "number" &&
+           LIST_STYLES.includes(node.attrs.listStyle)
+         ) {
+@@ -69,6 +219,23 @@ export default class OrderedList extends Node {
+     };
+   }
+ 
++  get plugins() {
++    return [
++      new Plugin<DecorationSet>({
++        state: {
++          init: (_, state) => buildMarkerDecorations(state.doc),
++          apply: (tr, value) =>
++            tr.docChanged ? buildMarkerDecorations(tr.doc) : value,
++        },
++        props: {
++          decorations(state) {
++            return this.getState(state);
++          },
++        },
++      }),
++    ];
++  }
++
+   commands({ type, schema }: { type: NodeType; schema: Schema }) {
+     return {
+       ordered_list: () => toggleList(type, schema.nodes.list_item),
+@@ -78,6 +245,8 @@ export default class OrderedList extends Node {
+ 
+       toggleUpperLetterList: () =>
+         toggleList(type, schema.nodes.list_item, "upper-alpha"),
++
++      setListStyle: (attrs?: unknown) => setListStyle(attrs),
+     };
+   }
+ 
+@@ -98,6 +267,22 @@ export default class OrderedList extends Node {
+         (match, node) => node.childCount + node.attrs.order === +match[1]
+       ),
+ 
++      // "۱. ", "۱) ", "۱- " (Persian or Arabic-Indic digits) and "1) ", "1- ":
++      // Persian digits are shown when the list is right-to-left, Western
++      // digits otherwise.
++      listWrappingInputRule(
++        /^([۰-۹٠-٩]+[.)-]|\d+[)-])\s$/,
++        type,
++        (match) => ({
++          order: parseDigits(match[1].slice(0, -1)),
++          listStyle: SUFFIX_STYLES[match[1].slice(-1)],
++        }),
++        (match, node) =>
++          node.attrs.listStyle === SUFFIX_STYLES[match[1].slice(-1)] &&
++          node.childCount + node.attrs.order ===
++            parseDigits(match[1].slice(0, -1))
++      ),
++
+       listWrappingInputRule(
+         /^([a-z])\.\s$/,
+         type,
+@@ -159,12 +344,14 @@ export default class OrderedList extends Node {
+         return result + ". ";
+       });
+     } else {
++      // Markdown has "1." and "1)" lists; "1-" is written as "1.".
++      const suffix = node.attrs.listStyle === "number-paren" ? ") " : ". ";
+       const maxW = `${start + node.childCount - 1}`.length;
+       const space = state.repeat(" ", maxW + 2);
+ 
+       state.renderList(node, space, (index: number) => {
+         const nStr = `${start + index}`;
+-        return state.repeat(" ", maxW - nStr.length) + nStr + ". ";
++        return state.repeat(" ", maxW - nStr.length) + nStr + suffix;
+       });
+     }
+   }
+@@ -185,6 +372,8 @@ export default class OrderedList extends Node {
+             listStyle = "lower-alpha";
+           } else if (tok.markup && /^[A-Z]/.test(tok.markup)) {
+             listStyle = "upper-alpha";
++          } else if (tok.markup === ")") {
++            listStyle = "number-paren";
+           }
+         }
+ 
+diff --git a/shared/editor/nodes/index.ts b/shared/editor/nodes/index.ts
+index 9186027..db002ad 100644
+--- a/shared/editor/nodes/index.ts
++++ b/shared/editor/nodes/index.ts
+@@ -4,6 +4,7 @@ import DeleteNearAtom from "../extensions/DeleteNearAtom";
+ import HeadingPrefix from "../extensions/HeadingPrefix";
+ import History from "../extensions/History";
+ import InputRuleUndo from "../extensions/InputRuleUndo";
++import ListDirection from "../extensions/ListDirection";
+ import MaxLength from "../extensions/MaxLength";
+ import CodeDirection from "../extensions/CodeDirection";
+ import TextAlignment from "../extensions/TextAlignment";
+@@ -88,6 +89,7 @@ export const listExtensions: Nodes = [
+   BulletList,
+   OrderedList,
+   ListItem,
++  ListDirection,
+ ];
+ 
+ export const tableExtensions: Nodes = [
+diff --git a/shared/editor/queries/getListDirection.test.ts b/shared/editor/queries/getListDirection.test.ts
+new file mode 100644
+index 0000000..55df660
+--- /dev/null
++++ b/shared/editor/queries/getListDirection.test.ts
+@@ -0,0 +1,50 @@
++import { parser } from "../../test/editor";
++import { getListDirection } from "./getListDirection";
++
++const RLM = "‏";
++
++/**
++ * Parses Markdown and returns its first block, expected to be a list.
++ *
++ * @param markdown the Markdown text.
++ * @returns the list node.
++ */
++function firstList(markdown: string) {
++  const list = parser.parse(markdown)?.firstChild;
++  if (!list) {
++    throw new Error("no list");
++  }
++  return list;
++}
++
++describe("getListDirection", () => {
++  it("is right-to-left when the first item is Persian", () => {
++    expect(getListDirection(firstList("1. سلام\n2. hello"))).toBe("rtl");
++  });
++
++  it("is left-to-right when the first item is English", () => {
++    expect(getListDirection(firstList("1. Hello\n2. سلام"))).toBe("ltr");
++  });
++
++  it("uses the explicit direction of the first item", () => {
++    expect(getListDirection(firstList(`1. ${RLM}Outline یک ویکی است`))).toBe(
++      "rtl"
++    );
++  });
++
++  it("skips items without letters", () => {
++    expect(getListDirection(firstList("- 123\n- سلام"))).toBe("rtl");
++  });
++
++  it("is not changed by a nested list of the other direction", () => {
++    const outer = firstList("1. Hello\n   1. سلام");
++    const nested = outer.firstChild?.child(1);
++
++    expect(getListDirection(outer)).toBe("ltr");
++    expect(nested && getListDirection(nested)).toBe("rtl");
++  });
++
++  it("has no direction while the list is empty", () => {
++    expect(getListDirection(firstList("1. 42"))).toBeNull();
++  });
++});
+diff --git a/shared/editor/queries/getListDirection.ts b/shared/editor/queries/getListDirection.ts
+new file mode 100644
+index 0000000..e824e4e
+--- /dev/null
++++ b/shared/editor/queries/getListDirection.ts
+@@ -0,0 +1,84 @@
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import type { EditorState } from "prosemirror-state";
++import type { TextDirection } from "../../utils/bidi";
++import { toTextDirection } from "../../utils/bidi";
++import { isRTL } from "../../utils/rtl";
++import { findParentNode } from "./findParentNode";
++
++/** Names of the list nodes that are laid out in their own direction. */
++export const listNodeNames = new Set([
++  "ordered_list",
++  "bullet_list",
++  "checkbox_list",
++]);
++
++/** Matches any letter, used to tell left-to-right text from no text. */
++const letter = /\p{L}/u;
++
++/**
++ * Returns the direction of a text block: its explicit direction when one is
++ * set, otherwise the direction of its first strong character, as `dir="auto"`
++ * does.
++ *
++ * @param node the text block, e.g. a paragraph or heading.
++ * @returns "rtl" or "ltr", or null when the block has no letters.
++ */
++export function getBlockDirection(node: ProsemirrorNode): TextDirection | null {
++  const explicit = toTextDirection(node.attrs.dir);
++  if (explicit) {
++    return explicit;
++  }
++  const text = node.textContent;
++  if (isRTL(text)) {
++    return "rtl";
++  }
++  return letter.test(text) ? "ltr" : null;
++}
++
++/**
++ * Returns the direction of a list, taken from its first item that has text.
++ * Only the item's own blocks are read; nested lists have their own direction.
++ *
++ * @param list the list node.
++ * @returns "rtl" or "ltr", or null when no item has text yet.
++ */
++export function getListDirection(list: ProsemirrorNode): TextDirection | null {
++  for (let i = 0; i < list.childCount; i++) {
++    const item = list.child(i);
++    for (let j = 0; j < item.childCount; j++) {
++      const block = item.child(j);
++      if (listNodeNames.has(block.type.name) || !block.isTextblock) {
++        continue;
++      }
++      const dir = getBlockDirection(block);
++      if (dir) {
++        return dir;
++      }
++    }
++  }
++  return null;
++}
++
++/**
++ * Returns the closest numbered list around the selection.
++ *
++ * @param state the editor state.
++ * @returns the list and its position, or undefined.
++ */
++export function findOrderedList(state: EditorState) {
++  return findParentNode((node) => node.type.name === "ordered_list")(
++    state.selection
++  );
++}
++
++/**
++ * Returns a function that tests whether the numbered list around the
++ * selection has the given style, for use as a menu item's `active` state.
++ *
++ * @param listStyle the list style, e.g. "number-paren".
++ * @returns a predicate over the editor state.
++ */
++export function isListStyleActive(listStyle: string) {
++  return (state: EditorState): boolean =>
++    findOrderedList(state)?.node.attrs.listStyle === listStyle;
++}

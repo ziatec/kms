@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Wed, 14 Oct 2026 12:45:00 +0330
+Subject: [PATCH 13/18] feat: page scrollbar on the left in the RTL interface
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.0 (2026-10-14)
+Root: build/outline-1.11.0 (apply after 0001..0012)
+
+In the Persian (RTL) interface the document's main (page) scrollbar is shown
+on the left side of the window; in LTR it stays on the right (native).
+
+Which side the native page scrollbar uses is decided by the browser (Firefox
+keeps it on the right whatever the page direction), so it cannot be moved with
+CSS. In RTL, on mouse/trackpad devices ((hover: hover) and (pointer: fine)),
+the native page scrollbar is hidden and RtlPageScrollbar draws a 14px bar on
+the left edge. It follows and drives the normal window scroll (thumb drag,
+click on the track to page), so everything that relies on window scrolling
+(headers, document zoom, hover cards, tables) is unchanged. Touch devices and
+print are unchanged.
+
+Files (2; N = new, M = modified, D = deleted):
+  N app/components/RtlPageScrollbar.tsx
+  M app/components/Theme.tsx
+
+---
+---
+
+diff --git a/app/components/RtlPageScrollbar.tsx b/app/components/RtlPageScrollbar.tsx
+new file mode 100644
+index 0000000..c7e99ad
+--- /dev/null
++++ b/app/components/RtlPageScrollbar.tsx
+@@ -0,0 +1,171 @@
++import * as React from "react";
++import styled, { createGlobalStyle } from "styled-components";
++import { s } from "@shared/styles";
++
++const MIN_THUMB = 32;
++
++/**
++ * Hides the browser's own page scrollbar on desktop (mouse) devices in the RTL
++ * interface. Which side the native page scrollbar is drawn on is up to the
++ * browser (Firefox keeps it on the right), so RtlPageScrollbar draws it.
++ */
++const HideNativeScrollbar = createGlobalStyle`
++  @media (hover: hover) and (pointer: fine) {
++    html {
++      scrollbar-width: none;
++    }
++    html::-webkit-scrollbar {
++      display: none;
++    }
++  }
++`;
++
++/**
++ * The page scrollbar for the RTL (Persian) interface, drawn on the left edge of
++ * the window. It drives and follows the normal window scroll, so everything
++ * that depends on window scrolling keeps working. In LTR the native scrollbar
++ * (right side) is used and this component is not mounted. (KMS patch 0013)
++ */
++export default function RtlPageScrollbar() {
++  const [thumb, setThumb] = React.useState<{
++    top: number;
++    height: number;
++  } | null>(null);
++  const [dragging, setDragging] = React.useState(false);
++  const drag = React.useRef<{ y: number; scrollTop: number } | null>(null);
++
++  const scroller = () =>
++    (document.scrollingElement as HTMLElement) ?? document.documentElement;
++
++  const update = React.useCallback(() => {
++    const el = scroller();
++    const track = window.innerHeight;
++    const total = el.scrollHeight;
++    const view = el.clientHeight;
++    if (total <= view + 1 || track <= 0) {
++      setThumb(null);
++      return;
++    }
++    const height = Math.max(MIN_THUMB, (track * view) / total);
++    const top = (el.scrollTop / (total - view)) * (track - height);
++    setThumb((prev) =>
++      prev && prev.top === top && prev.height === height
++        ? prev
++        : { top, height },
++    );
++  }, []);
++
++  React.useEffect(() => {
++    update();
++    window.addEventListener("scroll", update, { passive: true });
++    window.addEventListener("resize", update);
++    const observer = new ResizeObserver(update);
++    observer.observe(document.documentElement);
++    observer.observe(document.body);
++    return () => {
++      window.removeEventListener("scroll", update);
++      window.removeEventListener("resize", update);
++      observer.disconnect();
++    };
++  }, [update]);
++
++  const handleThumbPointerDown = (event: React.PointerEvent) => {
++    event.preventDefault();
++    event.stopPropagation();
++    event.currentTarget.setPointerCapture(event.pointerId);
++    drag.current = { y: event.clientY, scrollTop: scroller().scrollTop };
++    setDragging(true);
++  };
++
++  const handleThumbPointerMove = (event: React.PointerEvent) => {
++    if (!drag.current || !thumb) {
++      return;
++    }
++    const el = scroller();
++    const track = window.innerHeight;
++    const range = track - thumb.height;
++    if (range <= 0) {
++      return;
++    }
++    const ratio = (el.scrollHeight - el.clientHeight) / range;
++    el.scrollTop =
++      drag.current.scrollTop + (event.clientY - drag.current.y) * ratio;
++  };
++
++  const handleThumbPointerUp = (event: React.PointerEvent) => {
++    drag.current = null;
++    setDragging(false);
++    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
++      event.currentTarget.releasePointerCapture(event.pointerId);
++    }
++  };
++
++  // Clicking the track pages up or down, like a native scrollbar.
++  const handleTrackPointerDown = (event: React.PointerEvent) => {
++    if (!thumb) {
++      return;
++    }
++    const rect = event.currentTarget.getBoundingClientRect();
++    const y = event.clientY - rect.top;
++    const el = scroller();
++    const direction = y < thumb.top ? -1 : 1;
++    el.scrollBy({ top: direction * el.clientHeight * 0.9 });
++  };
++
++  return (
++    <>
++      <HideNativeScrollbar />
++      <Track
++        aria-hidden
++        $active={!!thumb}
++        onPointerDown={handleTrackPointerDown}
++      >
++        {thumb && (
++          <Thumb
++            $dragging={dragging}
++            style={{ top: thumb.top, height: thumb.height }}
++            onPointerDown={handleThumbPointerDown}
++            onPointerMove={handleThumbPointerMove}
++            onPointerUp={handleThumbPointerUp}
++            onPointerCancel={handleThumbPointerUp}
++          />
++        )}
++      </Track>
++    </>
++  );
++}
++
++const Track = styled.div<{ $active: boolean }>`
++  display: none;
++
++  @media (hover: hover) and (pointer: fine) {
++    display: ${(props) => (props.$active ? "block" : "none")};
++  }
++
++  @media print {
++    display: none;
++  }
++
++  position: fixed;
++  top: 0;
++  bottom: 0;
++  left: 0;
++  width: 14px;
++  z-index: 8000;
++  background: ${s("scrollbarBackground")};
++  opacity: 0.9;
++`;
++
++const Thumb = styled.div<{ $dragging: boolean }>`
++  position: absolute;
++  left: 2px;
++  right: 2px;
++  border-radius: 6px;
++  background: ${s("scrollbarThumb")};
++  opacity: ${(props) => (props.$dragging ? 1 : 0.8)};
++  touch-action: none;
++
++  &:hover {
++    opacity: 1;
++  }
++`;
+diff --git a/app/components/Theme.tsx b/app/components/Theme.tsx
+index ba65f38..f40d9b9 100644
+--- a/app/components/Theme.tsx
++++ b/app/components/Theme.tsx
+@@ -9,6 +9,7 @@ import { TeamPreference, UserPreference } from "@shared/types";
+ import { isRTLLanguage } from "@shared/utils/rtl";
+ import useBuildTheme from "~/hooks/useBuildTheme";
+ import useStores from "~/hooks/useStores";
++import RtlPageScrollbar from "./RtlPageScrollbar";
+ 
+ type Props = {
+   children?: React.ReactNode;
+@@ -64,6 +65,7 @@ const Theme: React.FC<Props> = ({ children }: Props) => {
+                 true
+               }
+             />
++            {direction === "rtl" && <RtlPageScrollbar />}
+             {children}
+           </>
+         </ThemeProvider>

@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Sat, 17 Oct 2026 12:30:00 +0330
+Subject: [PATCH 25/25] feat(license): request and activation files as
+ password-protected zips, the password derived from the file name
+
+VERSION: 1.0 (2026-10-17)
+Root: build/outline-1.11.0 (apply after 0001..0024)
+
+Both files that travel between the customer and the vendor are now a .zip
+with one AES-256 encrypted entry (WinZip AE-2: 7-Zip, WinRAR, Windows 11).
+The file name holds no customer data, only a random token:
+  KMS-<TOKEN>.zip            TOKEN = 16 characters A-Z, 2-7
+and the zip password comes from it:
+  printf %s TOKEN | openssl dgst -sha256 -hmac KMS-ZIP-1 | awk '{print $NF}' | cut -c1-32
+(kms-license.mjs 1.3: `node kms-license.mjs password FILE.zip`). A browser
+adding " (1)" to the name does no harm; removing the KMS-... part does.
+
+- License page, "Download license request": KMS-<TOKEN>.zip holding
+  license-request.kmsreq (still X25519-encrypted for the vendor inside).
+- License page, "Open activation file": accepts only a .zip; the new
+  admin-only API license.unzip opens it and fills the activation code box.
+- server/license/zip.ts replaces the yazl helper of patch 0022.
+
+Files (6; M = modified):
+  M server/license/zip.ts
+  M server/license/state.ts
+  M server/routes/api/license/license.ts
+  M server/routes/api/license/schema.ts
+  M app/scenes/Settings/License.tsx
+  M shared/i18n/locales/fa_IR/translation.json
+
+---
+---
+
+diff --git a/app/scenes/Settings/License.tsx b/app/scenes/Settings/License.tsx
+index 070a1a7..7da8fb0 100644
+--- a/app/scenes/Settings/License.tsx
++++ b/app/scenes/Settings/License.tsx
+@@ -2,9 +2,10 @@
+  * Settings → License: the customer and the validity of the license for every
+  * user; for admins the renewal request download and applying a new license.
+  *
+- * VERSION: 1.4 (2026-10-16) — KMS patch 0008; 1.2 = signature under the message;
++ * VERSION: 1.5 (2026-10-17) — KMS patch 0008; 1.2 = signature under the message;
+  * 1.3 = links registered by plugins (Hook.PageLink, patch 0010 v2.1);
+- * 1.4 = request form + .zip download (patch 0022)
++ * 1.4 = request form + .zip download (patch 0022);
++ * 1.5 = the activation file is read only as the password-protected .zip (patch 0025)
+  */
+ import { observer } from "mobx-react";
+ import { DownloadIcon, ShieldIcon } from "outline-icons";
+@@ -115,15 +116,35 @@ function License() {
+     }
+   }, [t, form]);
+ 
++  // KMS patch 0025: only the vendor's .zip is accepted; the server opens it
++  // (the password comes from the file name) and the code fills the box below.
+   const handleFile = React.useCallback(
+     async (ev: React.ChangeEvent<HTMLInputElement>) => {
+       const file = ev.target.files?.[0];
+-      if (file) {
+-        setText(await file.text());
+-      }
+       ev.target.value = "";
++      if (!file) {
++        return;
++      }
++      if (!/\.zip$/i.test(file.name) || file.size > 140000) {
++        toast.error(t("Choose the activation .zip file you received."));
++        return;
++      }
++      try {
++        const bytes = new Uint8Array(await file.arrayBuffer());
++        let binary = "";
++        for (let i = 0; i < bytes.length; i++) {
++          binary += String.fromCharCode(bytes[i]);
++        }
++        const res = await client.post("/license.unzip", {
++          zip: btoa(binary),
++          fileName: file.name,
++        });
++        setText(res.data.text);
++      } catch (err) {
++        toast.error((err as Error).message);
++      }
+     },
+-    []
++    [t]
+   );
+ 
+   const handleApply = React.useCallback(async () => {
+@@ -325,7 +346,7 @@ function License() {
+             <input
+               ref={fileRef}
+               type="file"
+-              accept=".kmslic,.txt,text/plain"
++              accept=".zip,application/zip"
+               onChange={handleFile}
+               hidden
+             />
+diff --git a/server/license/state.ts b/server/license/state.ts
+index 5566073..26800dc 100644
+--- a/server/license/state.ts
++++ b/server/license/state.ts
+@@ -14,7 +14,8 @@
+  * build). There is no runtime file and no environment override, so a customer
+  * cannot swap in their own key.
+  *
+- * VERSION: 1.2 (2026-10-16) — KMS patch 0008; 1.2 = embedded vendor key (patch 0023)
++ * VERSION: 1.3 (2026-10-17) — KMS patch 0008; 1.2 = embedded vendor key (patch 0023);
++ * 1.3 = request file name is a random token, zip password derived from it (patch 0025)
+  */
+ import { createHash, createPublicKey, type KeyObject } from "node:crypto";
+ import fs from "node:fs";
+@@ -35,6 +36,7 @@ import {
+   type RequestPayload,
+ } from "./format";
+ import { VENDOR_PUBLIC_KEY } from "./vendorKey";
++import { newZipName } from "./zip";
+ 
+ export type LicenseStatus =
+   | "active"
+@@ -449,18 +451,10 @@ export function createLicenseRequest(meta: {
+     privateKeyFromPem(privatePem),
+     loadVendorKeys(vendorJson).box
+   );
+-  const slug =
+-    (meta.contact?.legalName || meta.organization || "kms")
+-      .toLowerCase()
+-      .replace(/[^\p{L}\p{N}]+/gu, "-")
+-      .replace(/^-|-$/g, "")
+-      .slice(0, 40) || "kms";
+-  // KMS patch 0022: the time (not only the date) is in the name, so every
+-  // request file of a customer is unique. Short install id keeps two servers
+-  // of the same customer apart.
+-  const stamp = payload.createdAt.slice(0, 19).replace(/[-:T]/g, "");
+-  const base = `kms-license-request-${slug}-${stamp}-${identity.installId.slice(0, 8)}`;
+-  return { text, entryName: `${base}.kmsreq`, fileName: `${base}.zip` };
++  // KMS patch 0025: the file name holds only a random token (no customer
++  // data); the zip password is derived from it (server/license/zip.ts).
++  const { fileName } = newZipName();
++  return { text, entryName: "license-request.kmsreq", fileName };
+ }
+ 
+ /**
+diff --git a/server/license/zip.ts b/server/license/zip.ts
+index 6e0e90c..26ef4cd 100644
+--- a/server/license/zip.ts
++++ b/server/license/zip.ts
+@@ -1,30 +1,273 @@
+ /**
+- * A tiny helper to put the license request into a .zip file.
++ * Password-protected .zip files for the license request and the activation code.
+  *
+- * The request text is already encrypted for the vendor and signed by this
+- * server, so the entry is STORED (not compressed): the armored block stays
+- * verbatim in the zip bytes, so the vendor tool can read it even without a
+- * zip library. The zip is only a convenient, uniquely named container.
++ * Both files travel as a zip with one entry, encrypted with WinZip AES-256
++ * (AE-2; opens in 7-Zip, WinRAR, Windows 11, `7z x`). The file name carries
++ * no customer data, only a random token:
++ *   KMS-<TOKEN>.zip        TOKEN = 16 characters A-Z, 2-7
++ * and the password is derived from that token:
++ *   password = first 32 hex characters of HMAC-SHA256(key "KMS-ZIP-1", TOKEN)
++ * By hand:
++ *   printf %s TOKEN | openssl dgst -sha256 -hmac KMS-ZIP-1 | awk '{print $NF}' | cut -c1-32
++ * Only the token is used, so a browser adding " (1)" to the name does no harm.
++ * The entry inside stays encrypted for the vendor (request) or the server
++ * (activation) as before: the zip password only hides the file from casual eyes.
+  *
+- * VERSION: 1.0 (2026-10-16) — KMS patch 0022
++ * Reading also accepts an unencrypted zip (requests of servers with patch
++ * 0022 only) and AES-128/192 entries.
++ *
++ * Same code in: kms-license.mjs (vendor tool) and the kms-licenses plugin
++ * (server/license/zip.ts).
++ *
++ * VERSION: 2.0 (2026-10-17) — KMS patch 0025; 1.0 = stored, unencrypted zip (patch 0022)
+  */
+-import { ZipFile } from "yazl";
++import {
++  createCipheriv,
++  createHmac,
++  pbkdf2Sync,
++  randomBytes,
++  timingSafeEqual,
++} from "node:crypto";
++import { deflateRawSync, inflateRawSync } from "node:zlib";
++
++export const ZIP_SECRET = "KMS-ZIP-1";
++const TOKEN_RE = /KMS-([A-Z2-7]{16})/i;
++const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
++
++export class ZipError extends Error {}
++
++/** A new random token and the file name that carries it. */
++export function newZipName() {
++  const bytes = randomBytes(10);
++  let bits = 0;
++  let value = 0;
++  let token = "";
++  for (const b of bytes) {
++    value = (value << 8) | b;
++    bits += 8;
++    while (bits >= 5) {
++      token += B32[(value >>> (bits - 5)) & 31];
++      bits -= 5;
++    }
++  }
++  return { token, fileName: `KMS-${token}.zip` };
++}
++
++/** The token in a file name, or null. */
++export function tokenOf(fileName: string) {
++  const m = TOKEN_RE.exec(fileName || "");
++  return m ? m[1].toUpperCase() : null;
++}
++
++/** The zip password for a file name, or null when the name has no token. */
++export function passwordFor(fileName: string) {
++  const token = tokenOf(fileName);
++  return token ? zipPassword(token) : null;
++}
++
++/** The zip password for a file name (or a bare token). */
++export function zipPassword(fileNameOrToken: string) {
++  const token = tokenOf(fileNameOrToken) ?? (/^[A-Z2-7]{16}$/i.test(fileNameOrToken) ? fileNameOrToken.toUpperCase() : null);
++  if (!token) {
++    throw new ZipError(
++      "file name must keep its KMS-XXXXXXXXXXXXXXXX part (the password comes from it)"
++    );
++  }
++  return createHmac("sha256", ZIP_SECRET).update(token).digest("hex").slice(0, 32);
++}
++
++// --- AES (WinZip AE-2) -------------------------------------------------------
++
++const KEY_LEN: Record<number, number> = { 1: 16, 2: 24, 3: 32 };
++
++/** AES-CTR with WinZip's little-endian counter starting at 1. */
++function aesCtr(key: Buffer, data: Buffer) {
++  const ecb = createCipheriv(`aes-${key.length * 8}-ecb`, key, null);
++  ecb.setAutoPadding(false);
++  const out = Buffer.alloc(data.length);
++  const counter = Buffer.alloc(16);
++  for (let off = 0, n = 1; off < data.length; off += 16, n++) {
++    counter.fill(0);
++    let v = n;
++    for (let i = 0; i < 8 && v > 0; i++) {
++      counter[i] = v & 0xff;
++      v = Math.floor(v / 256);
++    }
++    const ks = ecb.update(counter);
++    const end = Math.min(16, data.length - off);
++    for (let i = 0; i < end; i++) {
++      out[off + i] = data[off + i] ^ ks[i];
++    }
++  }
++  return out;
++}
++
++function deriveKeys(password: string, salt: Buffer, strength: number) {
++  const len = KEY_LEN[strength];
++  const dk = pbkdf2Sync(Buffer.from(password, "utf8"), salt, 1000, 2 * len + 2, "sha1");
++  return { enc: dk.subarray(0, len), mac: dk.subarray(len, 2 * len), check: dk.subarray(2 * len) };
++}
++
++function dosDateTime(d: Date) {
++  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2);
++  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
++  return { time, date };
++}
+ 
+ /**
+- * Build a zip with a single stored (uncompressed) text entry.
++ * Builds a zip with one AES-256 encrypted, deflated entry.
+  *
+  * @param entryName The name of the file inside the zip.
+- * @param text The file contents.
+- * @returns The zip as a Buffer.
++ * @param data The file contents.
++ * @param password The zip password.
++ * @returns The zip bytes.
++ */
++export function writeEncryptedZip(entryName: string, data: Buffer | string, password: string) {
++  const plain = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
++  const salt = randomBytes(16);
++  const keys = deriveKeys(password, salt, 3);
++  const ct = aesCtr(keys.enc, deflateRawSync(plain));
++  const auth = createHmac("sha1", keys.mac).update(ct).digest().subarray(0, 10);
++  const body = Buffer.concat([salt, keys.check, ct, auth]);
++  const name = Buffer.from(entryName, "utf8");
++  // AES extra field: AE-2, "AE", strength 3 (256), real method 8 (deflate)
++  const extra = Buffer.alloc(11);
++  extra.writeUInt16LE(0x9901, 0);
++  extra.writeUInt16LE(7, 2);
++  extra.writeUInt16LE(2, 4);
++  extra.write("AE", 6, "latin1");
++  extra.writeUInt8(3, 8);
++  extra.writeUInt16LE(8, 9);
++  const { time, date } = dosDateTime(new Date());
++  const flags = 0x0001 | 0x0800; // encrypted, UTF-8 name
++
++  const local = Buffer.alloc(30);
++  local.writeUInt32LE(0x04034b50, 0);
++  local.writeUInt16LE(51, 4);
++  local.writeUInt16LE(flags, 6);
++  local.writeUInt16LE(99, 8);
++  local.writeUInt16LE(time, 10);
++  local.writeUInt16LE(date, 12);
++  local.writeUInt32LE(0, 14); // CRC is 0 in AE-2
++  local.writeUInt32LE(body.length, 18);
++  local.writeUInt32LE(plain.length, 22);
++  local.writeUInt16LE(name.length, 26);
++  local.writeUInt16LE(extra.length, 28);
++
++  const central = Buffer.alloc(46);
++  central.writeUInt32LE(0x02014b50, 0);
++  central.writeUInt16LE(0x033f, 4); // made by: Unix, 6.3
++  central.writeUInt16LE(51, 6);
++  central.writeUInt16LE(flags, 8);
++  central.writeUInt16LE(99, 10);
++  central.writeUInt16LE(time, 12);
++  central.writeUInt16LE(date, 14);
++  central.writeUInt32LE(0, 16);
++  central.writeUInt32LE(body.length, 20);
++  central.writeUInt32LE(plain.length, 24);
++  central.writeUInt16LE(name.length, 28);
++  central.writeUInt16LE(extra.length, 30);
++  central.writeUInt32LE((0o100644 << 16) >>> 0, 38);
++  central.writeUInt32LE(0, 42);
++
++  const cdOffset = local.length + name.length + extra.length + body.length;
++  const cdSize = central.length + name.length + extra.length;
++  const end = Buffer.alloc(22);
++  end.writeUInt32LE(0x06054b50, 0);
++  end.writeUInt16LE(1, 8);
++  end.writeUInt16LE(1, 10);
++  end.writeUInt32LE(cdSize, 12);
++  end.writeUInt32LE(cdOffset, 16);
++  return Buffer.concat([local, name, extra, body, central, name, extra, end]);
++}
++
++/**
++ * Reads the first file of a zip: AES encrypted (with the password) or not
++ * encrypted at all.
++ *
++ * @param zip The zip bytes.
++ * @param password The zip password (null: the file name had no token).
++ * @returns The entry name and contents.
+  */
+-export function storeTextZip(entryName: string, text: string): Promise<Buffer> {
+-  return new Promise((resolve, reject) => {
+-    const zip = new ZipFile();
+-    const chunks: Buffer[] = [];
+-    zip.outputStream.on("data", (c: Buffer) => chunks.push(c));
+-    zip.outputStream.on("error", reject);
+-    zip.outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+-    zip.addBuffer(Buffer.from(text, "utf8"), entryName, { compress: false });
+-    zip.end();
+-  });
++export function readZip(zip: Buffer, password: string | null) {
++  if (zip.length < 22 || zip.readUInt32LE(0) !== 0x04034b50) {
++    throw new ZipError("not a zip file");
++  }
++  let eocd = -1;
++  for (let i = zip.length - 22; i >= Math.max(0, zip.length - 22 - 65535); i--) {
++    if (zip.readUInt32LE(i) === 0x06054b50) {
++      eocd = i;
++      break;
++    }
++  }
++  if (eocd < 0) {
++    throw new ZipError("damaged zip file (no central directory)");
++  }
++  const count = zip.readUInt16LE(eocd + 10);
++  let p = zip.readUInt32LE(eocd + 16);
++  for (let n = 0; n < count; n++) {
++    if (zip.readUInt32LE(p) !== 0x02014b50) {
++      throw new ZipError("damaged zip file");
++    }
++    const flags = zip.readUInt16LE(p + 8);
++    let method = zip.readUInt16LE(p + 10);
++    const compSize = zip.readUInt32LE(p + 20);
++    const nameLen = zip.readUInt16LE(p + 28);
++    const extraLen = zip.readUInt16LE(p + 30);
++    const commentLen = zip.readUInt16LE(p + 32);
++    const localOffset = zip.readUInt32LE(p + 42);
++    const name = zip.subarray(p + 46, p + 46 + nameLen).toString(flags & 0x0800 ? "utf8" : "latin1");
++    const extra = zip.subarray(p + 46 + nameLen, p + 46 + nameLen + extraLen);
++    p += 46 + nameLen + extraLen + commentLen;
++    if (name.endsWith("/")) {
++      continue;
++    }
++    const lNameLen = zip.readUInt16LE(localOffset + 26);
++    const lExtraLen = zip.readUInt16LE(localOffset + 28);
++    const start = localOffset + 30 + lNameLen + lExtraLen;
++    let data = zip.subarray(start, start + compSize);
++    if (flags & 0x0001) {
++      if (method !== 99) {
++        throw new ZipError("this zip uses the old ZipCrypto encryption; use AES-256");
++      }
++      let strength = 0;
++      for (let e = 0; e + 4 <= extra.length; ) {
++        const id = extra.readUInt16LE(e);
++        const size = extra.readUInt16LE(e + 2);
++        if (id === 0x9901) {
++          strength = extra.readUInt8(e + 8);
++          method = extra.readUInt16LE(e + 9);
++        }
++        e += 4 + size;
++      }
++      const len = KEY_LEN[strength];
++      if (!len) {
++        throw new ZipError("unsupported zip encryption");
++      }
++      if (password === null) {
++        throw new ZipError(
++          "file name must keep its KMS-XXXXXXXXXXXXXXXX part (the password comes from it)"
++        );
++      }
++      const salt = data.subarray(0, len / 2);
++      const keys = deriveKeys(password, salt, strength);
++      const check = data.subarray(len / 2, len / 2 + 2);
++      if (!check.equals(keys.check)) {
++        throw new ZipError("wrong zip password: was the file renamed?");
++      }
++      const ct = data.subarray(len / 2 + 2, data.length - 10);
++      const mac = createHmac("sha1", keys.mac).update(ct).digest().subarray(0, 10);
++      if (!timingSafeEqual(mac, data.subarray(data.length - 10))) {
++        throw new ZipError("the zip file is damaged or was changed");
++      }
++      data = aesCtr(keys.enc, ct);
++    }
++    if (method === 8) {
++      data = inflateRawSync(data);
++    } else if (method !== 0) {
++      throw new ZipError(`unsupported zip compression (${method})`);
++    }
++    return { name, data: Buffer.from(data) };
++  }
++  throw new ZipError("the zip file is empty");
+ }
+diff --git a/server/routes/api/license/license.ts b/server/routes/api/license/license.ts
+index 988be85..5f5fc79 100644
+--- a/server/routes/api/license/license.ts
++++ b/server/routes/api/license/license.ts
+@@ -2,7 +2,9 @@
+  * license.info, license.request and license.apply. These work while the
+  * workspace is read-only, so an expired server can always be renewed.
+  *
+- * VERSION: 1.2 (2026-10-16) — KMS patch 0008; 1.2 = request form + zip (patch 0022)
++ * VERSION: 1.3 (2026-10-17) — KMS patch 0008; 1.2 = request form + zip (patch 0022);
++ * 1.3 = both files are AES-256 zips with the password derived from the name,
++ * license.unzip opens the activation zip (patch 0025)
+  */
+ import Router from "@koa/router";
+ import { UserRole } from "@shared/types";
+@@ -14,7 +16,12 @@ import {
+   startTrialIfNeeded,
+   type LicenseInfo,
+ } from "@server/license/state";
+-import { storeTextZip } from "@server/license/zip";
++import {
++  passwordFor,
++  readZip,
++  writeEncryptedZip,
++  zipPassword,
++} from "@server/license/zip";
+ import auth from "@server/middlewares/authentication";
+ import validate from "@server/middlewares/validate";
+ import type { APIContext } from "@server/types";
+@@ -64,9 +71,9 @@ router.post(
+         contact: { legalName, firstName, lastName, phone },
+         requested: { days, note },
+       });
+-      // KMS patch 0022: the request goes out as a .zip holding the encrypted
+-      // request; the contents are sent base64 so the browser saves the bytes.
+-      const zip = await storeTextZip(entryName, text);
++      // KMS patch 0025: an AES-256 zip, password derived from the file name;
++      // sent base64 so the browser saves the bytes.
++      const zip = writeEncryptedZip(entryName, text, zipPassword(fileName));
+       ctx.body = { data: { zip: zip.toString("base64"), fileName } };
+     } catch (err) {
+       throw ValidationError((err as Error).message);
+@@ -88,4 +95,28 @@ router.post(
+   }
+ );
+ 
++/**
++ * KMS patch 0025: opens the activation .zip sent by the vendor (password
++ * derived from its file name) and returns the activation code inside, which
++ * the page then applies with license.apply.
++ */
++router.post(
++  "license.unzip",
++  auth({ role: UserRole.Admin }),
++  validate(T.LicenseUnzipSchema),
++  async (ctx: APIContext<T.LicenseUnzipReq>) => {
++    const { zip, fileName } = ctx.input.body;
++    try {
++      const { data } = readZip(Buffer.from(zip, "base64"), passwordFor(fileName));
++      const text = data.toString("utf8");
++      if (!text.includes("-----BEGIN KMS ACTIVATION-----")) {
++        throw new Error("the zip holds no KMS activation code");
++      }
++      ctx.body = { data: { text } };
++    } catch (err) {
++      throw ValidationError((err as Error).message);
++    }
++  }
++);
++
+ export default router;
+diff --git a/server/routes/api/license/schema.ts b/server/routes/api/license/schema.ts
+index d8b8eb1..5e2671d 100644
+--- a/server/routes/api/license/schema.ts
++++ b/server/routes/api/license/schema.ts
+@@ -1,5 +1,6 @@
+ /**
+- * VERSION: 1.2 (2026-10-16) — KMS patch 0008; 1.2 = request form (patch 0022)
++ * VERSION: 1.3 (2026-10-17) — KMS patch 0008; 1.2 = request form (patch 0022);
++ * 1.3 = license.unzip (patch 0025)
+  */
+ import { z } from "zod";
+ import { BaseSchema } from "@server/routes/api/schema";
+@@ -29,3 +30,13 @@ export const LicenseRequestSchema = BaseSchema.extend({
+ });
+ 
+ export type LicenseRequestReq = z.infer<typeof LicenseRequestSchema>;
++
++/** KMS patch 0025: the activation .zip (base64) and its original file name. */
++export const LicenseUnzipSchema = BaseSchema.extend({
++  body: z.object({
++    zip: z.string().min(16).max(200000),
++    fileName: z.string().max(255),
++  }),
++});
++
++export type LicenseUnzipReq = z.infer<typeof LicenseUnzipSchema>;
+diff --git a/shared/i18n/locales/fa_IR/translation.json b/shared/i18n/locales/fa_IR/translation.json
+index b9f18a5..23988b7 100644
+--- a/shared/i18n/locales/fa_IR/translation.json
++++ b/shared/i18n/locales/fa_IR/translation.json
+@@ -2047,6 +2047,7 @@
+   "To renew or activate it, open Settings → License, download the request file and send it to your supplier.": "برای تمدید یا فعال‌سازی، به تنظیمات ← مجوز بروید، فایل درخواست را دریافت کنید و برای پشتیبان سامانه بفرستید.",
+   "Activation code": "کد فعال‌سازی",
+   "Open activation file": "باز کردن فایل فعال‌سازی",
++  "Choose the activation .zip file you received.": "فایل zip فعال‌سازی را که دریافت کرده‌اید انتخاب کنید.",
+   "Download the request file and send it to your supplier. It is encrypted and contains this server's identity. You will receive an activation code to apply below.": "فایل درخواست را دریافت کنید و برای پشتیبان سامانه بفرستید. این فایل رمزگذاری شده و شناسه‌ی این سرور را دارد. کد فعال‌سازی‌ای که دریافت می‌کنید را در پایین اعمال کنید.",
+   "Fill in your details, download the request file and send it to your supplier. It is encrypted and contains this server's identity. You will receive an activation code to apply below.": "مشخصات را وارد کنید، فایل درخواست را دریافت کنید و برای پشتیبان سامانه بفرستید. این فایل رمزگذاری شده و شناسه‌ی این سرور را دارد. کد فعال‌سازی‌ای که دریافت می‌کنید را در پایین اعمال کنید.",
+   "Name the license is for": "نام دارندهٔ مجوز",

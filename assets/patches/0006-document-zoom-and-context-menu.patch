@@ -1,0 +1,2315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 06/18] feat: document zoom, sidebar size, right-click menu for documents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001..0005)
+
+Document zoom and sidebar size (was 0010 v1.0):
+- Document zoom 50-200%: Ctrl+wheel and pinch (anchored at the pointer),
+  Ctrl/Cmd + = - 0 by event.code (Persian layout works). View-only, never
+  saved; another document, leaving the page or a reload returns to 100%.
+- CSS zoom on the document's Main column (--kms-doc-zoom); print is always
+  100%; mobile unchanged. Badge with the zoom percent at the inline-end top,
+  hidden at 100% and in print; click resets.
+- Editor menus (toolbars, block menu, suggestions, find & replace) portal
+  into a counter-zoomed host and scale with the document.
+- Settings > Preferences "Sidebar size" 80-150%, saved as the interfaceZoom
+  user preference (API: number 0.8-1.5); desktop only.
+
+Right-click menu for the document area (was 0011 v1.0):
+- Right-click on the title or body (read and edit mode) opens a document
+  menu built on the action system; policies hide or disable items.
+  Shift+right-click keeps the browser menu; mobile keeps the native
+  long-press; ContextMenu key / Shift+F10 open it at the caret.
+- Groups: clicked table/image/code block; selection (cut, copy, copy as
+  Markdown / plain text, paste, paste as plain text, comment, link); new
+  document / sub-document / from template; Insert; links and share; find &
+  replace, table of contents, full width, text direction, zoom; AI (disabled,
+  "Coming soon"); export and print; history, star, pin, move, duplicate,
+  template, archive, delete; log out.
+- Read-only and shared views offer only copy, link, view and export items.
+- The menu scales with the document zoom (Menu primitives accept a portal
+  container); DocumentZoom exposes zoom in / out / reset.
+
+Files (16; N = new, M = modified, D = deleted):
+  N app/actions/definitions/documentEditor.tsx
+  M app/actions/definitions/documents.tsx
+  M app/components/Sidebar/Sidebar.tsx
+  M app/components/primitives/Menu/MenuContext.tsx
+  M app/components/primitives/Menu/index.tsx
+  M app/editor/components/FloatingToolbar.tsx
+  M app/editor/index.tsx
+  M app/scenes/Document/components/Document.tsx
+  N app/scenes/Document/components/DocumentEditorContextMenu.tsx
+  N app/scenes/Document/components/DocumentZoom.tsx
+  N app/scenes/Document/components/ImageAltTextDialog.tsx
+  M app/scenes/Settings/Preferences.tsx
+  N app/scenes/Settings/components/InterfaceZoomSetting.tsx
+  M server/routes/api/users/schema.ts
+  M shared/types.ts
+  N shared/utils/zoom.ts
+
+---
+---
+
+diff --git a/app/actions/definitions/documentEditor.tsx b/app/actions/definitions/documentEditor.tsx
+new file mode 100644
+index 0000000..4d1d6a4
+--- /dev/null
++++ b/app/actions/definitions/documentEditor.tsx
+@@ -0,0 +1,981 @@
++/**
++ * Actions for the right-click menu of the document area (title and editor).
++ * Existing document actions are reused; the editor-specific ones are built
++ * here for the position that was clicked.
++ *
++ * VERSION: 1.0 (2026-10-11) — KMS patch 0006
++ */
++import copy from "copy-to-clipboard";
++import { capitalize } from "es-toolkit/compat";
++import {
++  CommentIcon,
++  CopyIcon,
++  DownloadIcon,
++  EditIcon,
++  InsertAboveIcon,
++  InsertBelowIcon,
++  InsertLeftIcon,
++  InsertRightIcon,
++  LinkIcon,
++  NewDocumentIcon,
++  PlusIcon,
++  PrintIcon,
++  SearchIcon,
++  ShapesIcon,
++  SparklesIcon,
++  TableOfContentsIcon,
++  TrashIcon,
++  ZoomInIcon,
++  ZoomOutIcon,
++} from "outline-icons";
++import { Fragment, Slice } from "prosemirror-model";
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import { NodeSelection, TextSelection } from "prosemirror-state";
++import type { EditorView } from "prosemirror-view";
++import { isInTable, selectedRect } from "prosemirror-tables";
++import * as React from "react";
++import { toast } from "sonner";
++import type { MenuItem as EditorMenuItem } from "@shared/editor/types";
++import { UserPreference } from "@shared/types";
++import { removeUrlFragment, removeUrlPathSuffix } from "@shared/utils/urls";
++import { ProsemirrorHelper } from "@shared/utils/ProsemirrorHelper";
++import type Document from "~/models/Document";
++import {
++  ActionSeparator,
++  createAction,
++  createActionWithChildren,
++  createInternalLinkAction,
++  createRootMenuAction,
++  resolve,
++} from "~/actions";
++import {
++  archiveDocument,
++  copyDocumentLink,
++  createDocumentAfter,
++  createNestedDocument,
++  createNewDocumentInAlphabeticalCollection,
++  createTemplateFromDocument,
++  deleteDocument,
++  downloadDocumentAsHTML,
++  downloadDocumentAsMarkdown,
++  duplicateDocument,
++  moveDocument,
++  openDocumentHistory,
++  pinDocument,
++  printDocument,
++  shareDocument,
++  starDocument,
++  unstarDocument,
++} from "~/actions/definitions/documents";
++import { logout } from "~/actions/definitions/navigation";
++import { ActiveDocumentSection } from "~/actions/sections";
++import TextDirectionIcon from "~/components/Icons/TextDirectionIcon";
++import type { Editor as TEditor } from "~/editor";
++import blockMenuItems from "~/editor/menus/block";
++import { getDocumentZoomControls } from "~/scenes/Document/components/DocumentZoom";
++import ImageAltTextDialog from "~/scenes/Document/components/ImageAltTextDialog";
++import type {
++  ActionContext,
++  ActionSeparator as TActionSeparator,
++  ActionVariant,
++} from "~/types";
++import { newDocumentPath } from "~/utils/routeHelpers";
++
++/** What was under the pointer (or caret) when the menu was opened. */
++export type DocumentEditorMenuTarget = {
++  /** The document being viewed or edited. */
++  document: Document;
++  /** The editor instance, when loaded. */
++  editor: TEditor | null;
++  /** Whether the click landed in the editor body (not the title). */
++  inEditor: boolean;
++  /** Document position under the pointer, when inEditor. */
++  pos: number | null;
++  /** Whether the editor accepts changes. */
++  editable: boolean;
++  /** Read-only or shared view: only copy, link, view and export. */
++  limited: boolean;
++  /** Whether this is the public shared view. */
++  isShare: boolean;
++  /** Whether the user may change the document. */
++  canUpdate: boolean;
++  /** Whether the user may comment. */
++  canComment: boolean;
++  /** Whether text is selected where the menu was opened. */
++  hasSelection: boolean;
++  /** The selected text, for selections outside the editor body. */
++  selectionText: string;
++  /** Whether the title (or another editable outside the body) was clicked. */
++  titleEditable: boolean;
++  /** Puts focus and the DOM selection back where they were on open. */
++  restoreSelection: () => void;
++  /** Position of the table cell under the pointer. */
++  tableCellPos: number | null;
++  /** Position of the image under the pointer. */
++  imagePos: number | null;
++  /** Position of the code block under the pointer. */
++  codePos: number | null;
++  /** Position of the nearest heading at or above the pointer. */
++  headingPos: number | null;
++  /** Explicit direction of the block under the pointer (patch 0001). */
++  blockDir: "rtl" | "ltr" | null;
++  /** Whether the table of contents is shown. */
++  tocShown: boolean;
++  /** Shows or hides the table of contents. */
++  setTocShown: (shown: boolean) => void;
++};
++
++/**
++ * Whether an existing action is visible in the context.
++ *
++ * @param action The action to check.
++ * @param ctx The action context.
++ * @returns false only when the action resolves to invisible.
++ */
++function isVisible(action: ActionVariant, ctx: ActionContext): boolean {
++  return resolve<boolean | undefined>(action.visible, ctx) !== false;
++}
++
++/** Whether the asynchronous Clipboard API can read text in this context. */
++export function canReadClipboard(): boolean {
++  return (
++    typeof navigator !== "undefined" &&
++    !!navigator.clipboard?.readText &&
++    (typeof window === "undefined" || window.isSecureContext)
++  );
++}
++
++/**
++ * Insert plain text as paragraphs, without markdown or rich text handling.
++ *
++ * @param view The editor view.
++ * @param text The text to insert.
++ */
++function insertPlainText(view: EditorView, text: string) {
++  const { state } = view;
++  const lines = text.replace(/\r\n?/g, "\n").split("\n");
++  if (lines.length === 1) {
++    view.dispatch(state.tr.insertText(text).scrollIntoView());
++    return;
++  }
++  const paragraph = state.schema.nodes.paragraph;
++  const nodes = lines.map((line) =>
++    paragraph.create(null, line ? state.schema.text(line) : undefined)
++  );
++  view.dispatch(
++    state.tr
++      .replaceSelection(new Slice(Fragment.from(nodes), 1, 1))
++      .scrollIntoView()
++  );
++}
++
++/**
++ * Place the caret at a position unless the selection already contains it.
++ *
++ * @param view The editor view.
++ * @param pos The document position.
++ */
++function caretAt(view: EditorView, pos: number) {
++  const { selection, doc } = view.state;
++  if (!selection.empty && pos >= selection.from && pos <= selection.to) {
++    return;
++  }
++  const safe = Math.max(0, Math.min(pos, doc.content.size));
++  view.dispatch(
++    view.state.tr.setSelection(TextSelection.near(doc.resolve(safe)))
++  );
++}
++
++/**
++ * Insert an empty paragraph after the block at `pos` (or reuse the block when
++ * it is an empty paragraph) and put the caret in it.
++ *
++ * @param view The editor view.
++ * @param pos The document position that was clicked.
++ */
++function prepareInsertAt(view: EditorView, pos: number) {
++  const { state } = view;
++  const paragraph = state.schema.nodes.paragraph;
++  const safe = Math.max(0, Math.min(pos, state.doc.content.size));
++  const $pos = state.doc.resolve(safe);
++
++  if ($pos.parent.isTextblock) {
++    if ($pos.parent.type === paragraph && $pos.parent.content.size === 0) {
++      view.dispatch(
++        state.tr.setSelection(TextSelection.create(state.doc, $pos.start()))
++      );
++      return;
++    }
++    const after = $pos.after($pos.depth);
++    const tr = state.tr.insert(after, paragraph.create());
++    view.dispatch(
++      tr.setSelection(TextSelection.create(tr.doc, after + 1)).scrollIntoView()
++    );
++    return;
++  }
++
++  const index = $pos.index();
++  if ($pos.parent.canReplaceWith(index, index, paragraph)) {
++    const tr = state.tr.insert(safe, paragraph.create());
++    view.dispatch(tr.setSelection(TextSelection.create(tr.doc, safe + 1)));
++    return;
++  }
++  view.dispatch(
++    state.tr.setSelection(TextSelection.near(state.doc.resolve(safe)))
++  );
++}
++
++/**
++ * The "copy link to heading" URL for the heading at `headingPos`, using the
++ * same anchor ids as the editor (ProsemirrorHelper.getHeadings).
++ *
++ * @param doc The editor document.
++ * @param headingPos Position of the heading node.
++ * @returns The URL, or undefined when the heading was not found.
++ */
++function headingUrl(doc: ProsemirrorNode, headingPos: number) {
++  let index = -1;
++  let count = 0;
++  doc.descendants((node, pos) => {
++    if (node.type.name === "heading") {
++      if (pos === headingPos) {
++        index = count;
++      }
++      count++;
++    }
++  });
++  const heading = ProsemirrorHelper.getHeadings(doc)[index];
++  if (!heading) {
++    return undefined;
++  }
++  const base = removeUrlPathSuffix(
++    removeUrlFragment(window.location.href),
++    "/edit"
++  );
++  return `${base}#${heading.id}`;
++}
++
++/**
++ * Build the root action of the document area context menu.
++ *
++ * @param target What was under the pointer when the menu opened.
++ * @returns The root menu action.
++ */
++export function createDocumentEditorMenuAction(
++  target: DocumentEditorMenuTarget
++) {
++  const {
++    document,
++    editor,
++    inEditor,
++    pos,
++    editable,
++    limited,
++    isShare,
++    canUpdate,
++    canComment,
++    hasSelection,
++    restoreSelection,
++  } = target;
++  const view = editor?.view;
++  const commands = editor?.commands as
++    | Record<string, ((attrs?: unknown) => unknown) | undefined>
++    | undefined;
++  const editorReady = !!view && !!commands && inEditor && pos !== null;
++  const canEditBody = editorReady && editable;
++
++  const run = (name: string, attrs?: unknown) => {
++    const command =
++      commands?.[name] ?? commands?.[`create${capitalize(name)}`];
++    command?.(attrs);
++  };
++
++  // 0. Context section -----------------------------------------------------
++
++  const tableIndexAction = (
++    name: string,
++    label: (ctx: ActionContext) => string,
++    icon: React.ReactNode,
++    command: string,
++    index: (rect: ReturnType<typeof selectedRect>) => number | undefined
++  ) =>
++    createAction({
++      name: label,
++      section: ActiveDocumentSection,
++      icon,
++      visible: canEditBody && target.tableCellPos !== null && !limited,
++      perform: () => {
++        if (!view || target.tableCellPos === null) {
++          return;
++        }
++        view.dispatch(
++          view.state.tr.setSelection(
++            TextSelection.near(view.state.doc.resolve(target.tableCellPos + 1))
++          )
++        );
++        if (!isInTable(view.state)) {
++          return;
++        }
++        const rect = selectedRect(view.state);
++        run(command, { index: index(rect) });
++      },
++      analyticsName: name,
++    });
++
++  const tableActions: ActionVariant[] = [
++    tableIndexAction(
++      "Context menu add row above",
++      ({ t }) => t("Add row above"),
++      <InsertAboveIcon />,
++      "addRowBefore",
++      (rect) => rect.top
++    ),
++    tableIndexAction(
++      "Context menu add row below",
++      ({ t }) => t("Add row below"),
++      <InsertBelowIcon />,
++      "addRowAfter",
++      (rect) => rect.bottom - 1
++    ),
++    tableIndexAction(
++      "Context menu add column before",
++      ({ t }) => t("Add column before"),
++      <InsertLeftIcon />,
++      "addColumnBefore",
++      (rect) => rect.left
++    ),
++    tableIndexAction(
++      "Context menu add column after",
++      ({ t }) => t("Add column after"),
++      <InsertRightIcon />,
++      "addColumnAfter",
++      (rect) => rect.right - 1
++    ),
++    tableIndexAction(
++      "Context menu delete row",
++      ({ t }) => t("Delete row"),
++      <TrashIcon />,
++      "deleteRow",
++      () => undefined
++    ),
++    tableIndexAction(
++      "Context menu delete column",
++      ({ t }) => t("Delete column"),
++      <TrashIcon />,
++      "deleteColumn",
++      () => undefined
++    ),
++  ];
++
++  const selectImage = () => {
++    if (!view || target.imagePos === null) {
++      return false;
++    }
++    const node = view.state.doc.nodeAt(target.imagePos);
++    if (node?.type.name !== "image") {
++      return false;
++    }
++    view.dispatch(
++      view.state.tr.setSelection(
++        NodeSelection.create(view.state.doc, target.imagePos)
++      )
++    );
++    return true;
++  };
++
++  const imageActions: ActionVariant[] = [
++    createAction({
++      name: ({ t }) => t("Download image"),
++      section: ActiveDocumentSection,
++      icon: <DownloadIcon />,
++      visible: editorReady && target.imagePos !== null,
++      perform: () => {
++        if (selectImage()) {
++          run("downloadImage");
++        }
++      },
++    }),
++    createAction({
++      name: ({ t }) => `${t("Edit alt text")}…`,
++      section: ActiveDocumentSection,
++      icon: <EditIcon />,
++      visible: canEditBody && target.imagePos !== null && !limited,
++      perform: ({ stores, t }) => {
++        if (!view || target.imagePos === null) {
++          return;
++        }
++        const imagePos = target.imagePos;
++        const node = view.state.doc.nodeAt(imagePos);
++        if (node?.type.name !== "image") {
++          return;
++        }
++        stores.dialogs.openModal({
++          title: t("Edit alt text"),
++          content: (
++            <ImageAltTextDialog
++              initialValue={String(node.attrs.alt ?? "")}
++              onSubmit={(alt) => {
++                const current = view.state.doc.nodeAt(imagePos);
++                if (current?.type.name === "image") {
++                  view.dispatch(
++                    view.state.tr.setNodeMarkup(imagePos, undefined, {
++                      ...current.attrs,
++                      alt: alt || null,
++                    })
++                  );
++                }
++                stores.dialogs.closeAllModals();
++              }}
++            />
++          ),
++        });
++      },
++    }),
++  ];
++
++  const codeActions: ActionVariant[] = [
++    createAction({
++      name: ({ t }) => t("Copy code"),
++      section: ActiveDocumentSection,
++      icon: <CopyIcon />,
++      visible: editorReady && target.codePos !== null,
++      perform: ({ t }) => {
++        if (!view || target.codePos === null) {
++          return;
++        }
++        const node = view.state.doc.nodeAt(target.codePos);
++        if (node) {
++          copy(node.textContent);
++          toast.success(t("Copied to clipboard"));
++        }
++      },
++    }),
++  ];
++
++  // 1. Selection ------------------------------------------------------------
++
++  const execClipboard = (command: "copy" | "cut") => {
++    restoreSelection();
++    try {
++      window.document.execCommand(command);
++    } catch {
++      // Some browsers refuse; the native menu (Shift+right-click) still works.
++    }
++  };
++
++  const selectedSlice = () => {
++    if (!view) {
++      return undefined;
++    }
++    const { from, to } = view.state.selection;
++    return from === to ? undefined : view.state.doc.slice(from, to);
++  };
++
++  const clipboardReadable = canReadClipboard();
++  const pasteTooltip = ({ t }: ActionContext) =>
++    clipboardReadable
++      ? undefined
++      : t("Not allowed by the browser. Use Shift+right-click for its menu.");
++
++  const pasteFailed = (t: ActionContext["t"]) =>
++    toast.error(
++      t("Not allowed by the browser. Use Shift+right-click for its menu.")
++    );
++
++  const selectionActions: ActionVariant[] = [
++    createAction({
++      name: ({ t }) => t("Cut"),
++      section: ActiveDocumentSection,
++      visible:
++        hasSelection &&
++        !limited &&
++        (inEditor ? canEditBody : target.titleEditable),
++      perform: () => execClipboard("cut"),
++    }),
++    createAction({
++      name: ({ t }) => t("Copy"),
++      section: ActiveDocumentSection,
++      icon: <CopyIcon />,
++      visible: hasSelection,
++      perform: () => execClipboard("copy"),
++    }),
++    createAction({
++      name: ({ t }) => t("Copy as Markdown"),
++      section: ActiveDocumentSection,
++      visible: hasSelection,
++      perform: ({ t }) => {
++        const slice = inEditor ? selectedSlice() : undefined;
++        const text =
++          slice && editor
++            ? editor.serializer.serialize(slice.content, { commonMark: true })
++            : target.selectionText;
++        copy(text);
++        toast.success(t("Copied to clipboard"));
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Copy as plain text"),
++      section: ActiveDocumentSection,
++      visible: hasSelection,
++      perform: ({ t }) => {
++        const slice = inEditor ? selectedSlice() : undefined;
++        const text =
++          slice && view
++            ? view.state.doc.textBetween(
++                view.state.selection.from,
++                view.state.selection.to,
++                "\n\n",
++                "\n"
++              )
++            : target.selectionText;
++        copy(text);
++        toast.success(t("Copied to clipboard"));
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Paste"),
++      section: ActiveDocumentSection,
++      visible: !limited && (inEditor ? canEditBody : target.titleEditable),
++      disabled: !clipboardReadable,
++      tooltip: pasteTooltip,
++      perform: async ({ t }) => {
++        try {
++          restoreSelection();
++          if (inEditor && view) {
++            if (navigator.clipboard.read) {
++              const items = await navigator.clipboard.read();
++              for (const item of items) {
++                if (item.types.includes("text/html")) {
++                  const html = await (await item.getType("text/html")).text();
++                  view.pasteHTML(html);
++                  return;
++                }
++                if (item.types.includes("text/plain")) {
++                  const text = await (
++                    await item.getType("text/plain")
++                  ).text();
++                  view.pasteText(text);
++                  return;
++                }
++              }
++              return;
++            }
++            view.pasteText(await navigator.clipboard.readText());
++            return;
++          }
++          const text = await navigator.clipboard.readText();
++          restoreSelection();
++          window.document.execCommand("insertText", false, text);
++        } catch {
++          pasteFailed(t);
++        }
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Paste as plain text"),
++      section: ActiveDocumentSection,
++      visible: !limited && (inEditor ? canEditBody : target.titleEditable),
++      disabled: !clipboardReadable,
++      tooltip: pasteTooltip,
++      perform: async ({ t }) => {
++        try {
++          const text = await navigator.clipboard.readText();
++          restoreSelection();
++          if (inEditor && view) {
++            insertPlainText(view, text);
++          } else {
++            window.document.execCommand("insertText", false, text);
++          }
++        } catch {
++          pasteFailed(t);
++        }
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Add comment"),
++      section: ActiveDocumentSection,
++      icon: <CommentIcon />,
++      visible:
++        hasSelection &&
++        inEditor &&
++        !limited &&
++        canComment &&
++        !!commands?.comment,
++      perform: () => {
++        restoreSelection();
++        run("comment");
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Add link"),
++      section: ActiveDocumentSection,
++      icon: <LinkIcon />,
++      visible: hasSelection && canEditBody && !limited,
++      perform: () => {
++        restoreSelection();
++        run("addLink", { href: "" });
++      },
++    }),
++  ];
++
++  // 2. Create ---------------------------------------------------------------
++
++  const newFromTemplate = createActionWithChildren({
++    name: ({ t }) => t("New from template"),
++    section: ActiveDocumentSection,
++    icon: <ShapesIcon />,
++    visible: ({ currentTeamId, stores }) =>
++      !limited &&
++      !!currentTeamId &&
++      stores.policies.abilities(currentTeamId).createDocument,
++    children: ({ stores }) =>
++      stores.templates.published
++        .filter(
++          (template) =>
++            template.isWorkspaceTemplate ||
++            template.collectionId === document.collectionId
++        )
++        .map((template) =>
++          createInternalLinkAction({
++            name: template.titleWithDefault,
++            section: ActiveDocumentSection,
++            visible: !!document.collectionId,
++            to: ({ sidebarContext }) => {
++              const [pathname, search] = newDocumentPath(
++                document.collectionId,
++                { templateId: template.id }
++              ).split("?");
++              return { pathname, search, state: { sidebarContext } };
++            },
++          })
++        ),
++  });
++
++  const createActions: ActionVariant[] = [
++    {
++      ...createDocumentAfter,
++      id: "kms-context-new-sibling",
++      name: ({ t }: ActionContext) => t("New document"),
++      icon: <NewDocumentIcon />,
++      visible: (ctx: ActionContext) =>
++        !limited && isVisible(createDocumentAfter, ctx),
++    },
++    {
++      ...createNestedDocument,
++      id: "kms-context-new-nested",
++      name: ({ t }: ActionContext) => t("New sub-document"),
++      visible: (ctx: ActionContext) =>
++        !limited &&
++        isVisible(createNestedDocument, ctx) &&
++        // In alphabetical collections the next item covers this.
++        !isVisible(createNewDocumentInAlphabeticalCollection, ctx),
++    },
++    {
++      ...createNewDocumentInAlphabeticalCollection,
++      id: "kms-context-new-alpha",
++      name: ({ t }: ActionContext) => t("New sub-document"),
++      visible: (ctx: ActionContext) =>
++        !limited && isVisible(createNewDocumentInAlphabeticalCollection, ctx),
++    },
++    newFromTemplate,
++  ];
++
++  // 3. Insert ---------------------------------------------------------------
++
++  const insertChildren = (ctx: ActionContext) => {
++    if (!view || !commands || pos === null) {
++      return [];
++    }
++    const documentRef = {
++      current: view.dom as HTMLDivElement,
++    } as React.RefObject<HTMLDivElement>;
++    const skip = new Set(["image", "video", "attachment", "embed", "noop"]);
++    const items: (ActionVariant | TActionSeparator)[] = [];
++    for (const item of blockMenuItems(ctx.t, documentRef) as EditorMenuItem[]) {
++      if (item.name === "separator") {
++        items.push(ActionSeparator);
++        continue;
++      }
++      if (
++        !item.name ||
++        skip.has(item.name) ||
++        item.visible === false ||
++        item.defaultHidden ||
++        (!commands[item.name] && !commands[`create${capitalize(item.name)}`])
++      ) {
++        continue;
++      }
++      const name = item.name;
++      items.push(
++        createAction({
++          name: String(item.title ?? item.label ?? name),
++          section: ActiveDocumentSection,
++          icon: item.icon,
++          perform: () => {
++            prepareInsertAt(view, pos);
++            const attrs =
++              typeof item.attrs === "function"
++                ? item.attrs(view.state)
++                : item.attrs;
++            run(name, attrs);
++            if (item.appendSpace) {
++              view.dispatch(view.state.tr.insertText(" "));
++            }
++            view.focus();
++          },
++        })
++      );
++    }
++    return items;
++  };
++
++  const insertAction = createActionWithChildren({
++    name: ({ t }) => t("Insert"),
++    section: ActiveDocumentSection,
++    icon: <PlusIcon />,
++    visible: canEditBody && !limited,
++    children: insertChildren,
++  });
++
++  // 4. Link -----------------------------------------------------------------
++
++  const linkActions: ActionVariant[] = [
++    {
++      ...copyDocumentLink,
++      id: "kms-context-copy-link",
++      name: ({ t }: ActionContext) => t("Copy link to document"),
++      icon: <LinkIcon />,
++      iconInContextMenu: true,
++      visible: !isShare,
++    },
++    createAction({
++      name: ({ t }) => t("Copy link to document"),
++      section: ActiveDocumentSection,
++      icon: <LinkIcon />,
++      visible: isShare,
++      perform: ({ t }) => {
++        copy(
++          removeUrlPathSuffix(removeUrlFragment(window.location.href), "/edit")
++        );
++        toast.success(t("Link copied to clipboard"));
++      },
++    }),
++    createAction({
++      name: ({ t }) => t("Copy link to this heading"),
++      section: ActiveDocumentSection,
++      visible: editorReady && target.headingPos !== null,
++      perform: ({ t }) => {
++        if (!view || target.headingPos === null) {
++          return;
++        }
++        const url = headingUrl(view.state.doc, target.headingPos);
++        if (url) {
++          copy(url);
++          toast.success(t("Link copied to clipboard"));
++        }
++      },
++    }),
++    {
++      ...shareDocument,
++      id: "kms-context-share",
++      visible: (ctx: ActionContext) =>
++        !limited && isVisible(shareDocument, ctx),
++    },
++  ];
++
++  // 5. View -----------------------------------------------------------------
++
++  const zoom = getDocumentZoomControls();
++  const directionAction = (
++    dir: "rtl" | "ltr" | null,
++    label: (ctx: ActionContext) => string
++  ) =>
++    createAction({
++      name: label,
++      section: ActiveDocumentSection,
++      icon: <TextDirectionIcon dir={dir ?? "auto"} />,
++      selected: target.blockDir === dir,
++      perform: () => {
++        if (!view || pos === null) {
++          return;
++        }
++        caretAt(view, pos);
++        run("setTextDirection", { dir });
++      },
++    });
++
++  const viewActions: ActionVariant[] = [
++    createAction({
++      name: ({ t }) => `${t("Find and replace")}…`,
++      section: ActiveDocumentSection,
++      icon: <SearchIcon />,
++      visible: !!commands?.openFindAndReplace,
++      perform: () => run("openFindAndReplace"),
++    }),
++    createAction({
++      name: ({ t }) => t("Table of contents"),
++      section: ActiveDocumentSection,
++      icon: <TableOfContentsIcon />,
++      selected: target.tocShown,
++      perform: () => target.setTocShown(!target.tocShown),
++    }),
++    createAction({
++      name: ({ t }) => t("Full width"),
++      section: ActiveDocumentSection,
++      selected: document.fullWidth,
++      perform: ({ stores }) => {
++        const checked = !document.fullWidth;
++        document.fullWidth = checked;
++        if (canUpdate && !isShare) {
++          const user = stores.auth.user;
++          if (user) {
++            user.setPreference(UserPreference.FullWidthDocuments, checked);
++            void user.save();
++          }
++          void document.save({ fullWidth: checked });
++        }
++      },
++    }),
++    createActionWithChildren({
++      name: ({ t }) => t("Text direction"),
++      section: ActiveDocumentSection,
++      icon: <TextDirectionIcon dir={target.blockDir ?? "auto"} />,
++      visible: canEditBody && !limited && !!commands?.setTextDirection,
++      children: [
++        directionAction("rtl", ({ t }) => t("Right to left")),
++        directionAction("ltr", ({ t }) => t("Left to right")),
++        directionAction(null, ({ t }) => t("Automatic direction")),
++      ],
++    }),
++    createActionWithChildren({
++      name: ({ t }) => t("Zoom"),
++      section: ActiveDocumentSection,
++      icon: <ZoomInIcon />,
++      visible: !!zoom,
++      children: [
++        createAction({
++          name: ({ t }) => t("Zoom in"),
++          section: ActiveDocumentSection,
++          icon: <ZoomInIcon />,
++          perform: () => getDocumentZoomControls()?.zoomIn(),
++        }),
++        createAction({
++          name: ({ t }) => t("Zoom out"),
++          section: ActiveDocumentSection,
++          icon: <ZoomOutIcon />,
++          perform: () => getDocumentZoomControls()?.zoomOut(),
++        }),
++        createAction({
++          name: ({ t }) => t("Reset zoom"),
++          section: ActiveDocumentSection,
++          selected: (zoom?.getZoom() ?? 1) === 1,
++          perform: () => getDocumentZoomControls()?.reset(),
++        }),
++      ],
++    }),
++  ];
++
++  // 6. AI (coming soon) -------------------------------------------------------
++
++  const aiAction = (label: (ctx: ActionContext) => string, id: string) =>
++    createAction({
++      id: `kms-ai-${id}`,
++      name: label,
++      section: ActiveDocumentSection,
++      visible: true,
++      disabled: true,
++      tooltip: ({ t }) => t("Coming soon"),
++      perform: () => undefined,
++    });
++
++  const aiMenu = createActionWithChildren({
++    name: ({ t }) => t("AI"),
++    section: ActiveDocumentSection,
++    icon: <SparklesIcon />,
++    visible: !limited,
++    children: [
++      aiAction(({ t }) => t("Summarize"), "summarize"),
++      aiAction(({ t }) => t("Rewrite / improve"), "rewrite"),
++      aiAction(({ t }) => t("Translate fa ↔ en"), "translate"),
++      aiAction(({ t }) => t("Continue writing"), "continue"),
++      aiAction(({ t }) => t("Fix spelling"), "spelling"),
++    ],
++  });
++
++  // 7. Export ------------------------------------------------------------------
++
++  const exportMenu = createActionWithChildren({
++    name: ({ t }) => t("Export"),
++    section: ActiveDocumentSection,
++    icon: <DownloadIcon />,
++    children: [
++      downloadDocumentAsMarkdown,
++      downloadDocumentAsHTML,
++      ActionSeparator,
++      createAction({
++        name: ({ t }) => t("PDF (print → save as PDF)"),
++        section: ActiveDocumentSection,
++        icon: <PrintIcon />,
++        iconInContextMenu: false,
++        visible: !!window.print,
++        perform: () => {
++          setTimeout(window.print, 0);
++        },
++      }),
++      printDocument,
++    ],
++  });
++
++  // 8. Document ----------------------------------------------------------------
++
++  const documentActions: ActionVariant[] = limited
++    ? []
++    : [
++        openDocumentHistory,
++        starDocument,
++        unstarDocument,
++        pinDocument,
++        moveDocument,
++        duplicateDocument,
++        createTemplateFromDocument,
++        archiveDocument,
++        deleteDocument,
++      ];
++
++  // 9. Log out -------------------------------------------------------------------
++
++  const logoutAction = {
++    ...logout,
++    id: "kms-context-logout",
++    visible: ({ currentUserId }: ActionContext) =>
++      !limited && !isShare && !!currentUserId,
++  };
++
++  const contextActions: ActionVariant[] = [
++    ...(target.tableCellPos !== null ? tableActions : []),
++    ...(target.imagePos !== null ? imageActions : []),
++    ...(target.codePos !== null ? codeActions : []),
++  ];
++
++  return createRootMenuAction([
++    ...contextActions,
++    ActionSeparator,
++    ...selectionActions,
++    ActionSeparator,
++    ...createActions,
++    ActionSeparator,
++    insertAction,
++    ActionSeparator,
++    ...linkActions,
++    ActionSeparator,
++    ...viewActions,
++    ActionSeparator,
++    aiMenu,
++    ActionSeparator,
++    exportMenu,
++    ActionSeparator,
++    ...documentActions,
++    ActionSeparator,
++    logoutAction,
++  ]);
++}
+diff --git a/app/actions/definitions/documents.tsx b/app/actions/definitions/documents.tsx
+index ca75893..500e31b 100644
+--- a/app/actions/definitions/documents.tsx
++++ b/app/actions/definitions/documents.tsx
+@@ -363,7 +363,7 @@ const createDocumentBefore = createInternalLinkAction({
+   },
+ });
+ 
+-const createDocumentAfter = createInternalLinkAction({
++export const createDocumentAfter = createInternalLinkAction({
+   name: ({ t }) => t("After"),
+   analyticsName: "New document after",
+   section: ActiveDocumentSection,
+diff --git a/app/components/Sidebar/Sidebar.tsx b/app/components/Sidebar/Sidebar.tsx
+index 523ef45..e727c3d 100644
+--- a/app/components/Sidebar/Sidebar.tsx
++++ b/app/components/Sidebar/Sidebar.tsx
+@@ -5,6 +5,7 @@ import { useHistory } from "react-router-dom";
+ import styled, { useTheme } from "styled-components";
+ import breakpoint from "styled-components-breakpoint";
+ import { depths, s } from "@shared/styles";
++import { UserPreference } from "@shared/types";
+ import { Avatar } from "~/components/Avatar";
+ import Flex from "~/components/Flex";
+ import useCurrentUser from "~/hooks/useCurrentUser";
+@@ -258,11 +259,18 @@ function Sidebar({
+     [ui, history]
+   );
+ 
++  // Sidebar zoom from Preferences (KMS patch 0006). ui.sidebarWidth stays in
++  // visual px, so the layout width is divided by the zoom.
++  const uiZoom = isMobile
++    ? 1
++    : Number(user?.getPreference(UserPreference.InterfaceZoom, 1)) || 1;
++
+   const style = React.useMemo(
+-    () => ({
+-      width: `${width}px`,
+-    }),
+-    [width]
++    (): React.CSSProperties =>
++      uiZoom === 1
++        ? { width: `${width}px` }
++        : { width: `${width / uiZoom}px`, zoom: uiZoom },
++    [width, uiZoom]
+   );
+ 
+   const handleCloseSidebar = () => {
+diff --git a/app/components/primitives/Menu/MenuContext.tsx b/app/components/primitives/Menu/MenuContext.tsx
+index 08b14cf..808113e 100644
+--- a/app/components/primitives/Menu/MenuContext.tsx
++++ b/app/components/primitives/Menu/MenuContext.tsx
+@@ -4,18 +4,25 @@ type MenuVariant = "dropdown" | "context";
+ 
+ const MenuContext = createContext<{
+   variant: MenuVariant;
++  /**
++   * Element the menu content is portaled into, defaults to the body. Used by
++   * the document context menu to scale with the document zoom (KMS 0006).
++   */
++  container?: HTMLElement | null;
+ }>({
+   variant: "dropdown",
+ });
+ 
+ export function MenuProvider({
+   variant,
++  container,
+   children,
+ }: {
+   variant: MenuVariant;
++  container?: HTMLElement | null;
+   children: React.ReactNode;
+ }) {
+-  const ctx = useMemo(() => ({ variant }), [variant]);
++  const ctx = useMemo(() => ({ variant, container }), [variant, container]);
+ 
+   return <MenuContext.Provider value={ctx}>{children}</MenuContext.Provider>;
+ }
+diff --git a/app/components/primitives/Menu/index.tsx b/app/components/primitives/Menu/index.tsx
+index f0c0bfc..c58abb5 100644
+--- a/app/components/primitives/Menu/index.tsx
++++ b/app/components/primitives/Menu/index.tsx
+@@ -81,7 +81,7 @@ type ContentProps = React.ComponentPropsWithoutRef<
+   };
+ 
+ function MenuContent(props: ContentProps) {
+-  const { variant } = useMenuContext();
++  const { variant, container } = useMenuContext();
+   const { ref, children, ...rest } = props;
+ 
+   const Portal =
+@@ -109,7 +109,7 @@ function MenuContent(props: ContentProps) {
+   };
+ 
+   return (
+-    <Portal>
++    <Portal container={container ?? undefined}>
+       <Content ref={ref} {...offsetProp} {...rest} collisionPadding={6} asChild>
+         <Components.MenuContent {...contentProps} hiddenScrollbars>
+           {children}
+@@ -159,7 +159,7 @@ type SubMenuContentProps = React.ComponentPropsWithoutRef<
+   };
+ 
+ function SubMenuContent(props: SubMenuContentProps) {
+-  const { variant } = useMenuContext();
++  const { variant, container } = useMenuContext();
+   const { ref, children, ...rest } = props;
+ 
+   const Portal =
+@@ -184,7 +184,7 @@ function SubMenuContent(props: SubMenuContentProps) {
+   };
+ 
+   return (
+-    <Portal>
++    <Portal container={container ?? undefined}>
+       <Content ref={ref} {...rest} collisionPadding={6} asChild>
+         <Components.MenuContent {...contentProps} hiddenScrollbars>
+           {children}
+diff --git a/app/editor/components/FloatingToolbar.tsx b/app/editor/components/FloatingToolbar.tsx
+index 06f926c..248dfcc 100644
+--- a/app/editor/components/FloatingToolbar.tsx
++++ b/app/editor/components/FloatingToolbar.tsx
+@@ -14,6 +14,7 @@ import useKeyboardStickyOffset from "~/hooks/useKeyboardStickyOffset";
+ import useMobile from "~/hooks/useMobile";
+ import Logger from "~/utils/Logger";
+ import { useEditor } from "./EditorContext";
++import { getDocZoom } from "@shared/utils/zoom";
+ import {
+   getColumnBounds,
+   getColumnIndex,
+@@ -52,7 +53,8 @@ function usePosition({
+   const { view } = useEditor();
+   const { selection } = view.state;
+   const [menuWidth, setMenuWidth] = React.useState(0);
+-  const menuHeight = 36;
++  // The 36px bar is scaled with the document zoom (KMS patch 0006).
++  const menuHeight = 36 * getDocZoom(menuRef.current);
+ 
+   // Measure the menu width after DOM updates to ensure accurate positioning.
+   // Runs after every render by design, the width comparison prevents a loop.
+diff --git a/app/editor/index.tsx b/app/editor/index.tsx
+index e0ac561..8357859 100644
+--- a/app/editor/index.tsx
++++ b/app/editor/index.tsx
+@@ -245,6 +245,8 @@ export class Editor extends React.PureComponent<
+   extensions: ExtensionManager;
+   elementRef = React.createRef<HTMLDivElement>();
+   wrapperRef = React.createRef<HTMLDivElement>();
++  /** Host for editor menus, counter-zoomed for the document zoom (KMS 0006). */
++  portalRef = React.createRef<HTMLDivElement>();
+   view: EditorView;
+   schema: Schema;
+   plugins: Plugin[];
+@@ -1105,7 +1107,7 @@ export class Editor extends React.PureComponent<
+     const { isRTL } = this.state;
+ 
+     return (
+-      <PortalContext.Provider value={this.wrapperRef.current}>
++      <PortalContext.Provider value={this.portalRef.current}>
+         <EditorContext.Provider value={this}>
+           <Flex
+             ref={this.wrapperRef}
+@@ -1151,6 +1153,7 @@ export class Editor extends React.PureComponent<
+                 </>
+               )}
+             </Observer>
++            <PortalHost ref={this.portalRef} />
+           </Flex>
+           {!isNull(this.state.activeLightboxImage) && (
+             <Lightbox
+@@ -1167,6 +1170,20 @@ export class Editor extends React.PureComponent<
+   }
+ }
+ 
++/**
++ * Editor menus portal here. The host undoes the document zoom (KMS patch
++ * 0010) so menus are positioned in plain viewport px, and each menu's content
++ * is zoomed again so it matches the document. Without the variable both
++ * zooms are 1.
++ */
++const PortalHost = styled.div`
++  zoom: calc(1 / var(--kms-doc-zoom, 1));
++
++  & > * > * {
++    zoom: var(--kms-doc-zoom, 1);
++  }
++`;
++
+ const StyledEditorContainer = styled(Styles)<{
+   userId?: string;
+   focusedCommentId?: string;
+diff --git a/app/scenes/Document/components/Document.tsx b/app/scenes/Document/components/Document.tsx
+index aaa1c7c..3e880fd 100644
+--- a/app/scenes/Document/components/Document.tsx
++++ b/app/scenes/Document/components/Document.tsx
+@@ -43,6 +43,8 @@ import {
+ import { useDocumentSave } from "../hooks/useDocumentSave";
+ import Container from "./Container";
+ import Contents from "./Contents";
++import DocumentEditorContextMenu from "./DocumentEditorContextMenu";
++import DocumentZoom from "./DocumentZoom";
+ import Editor from "./Editor";
+ import Header from "./Header";
+ import Notices, { DocumentNotice } from "./Notices";
+@@ -101,6 +103,7 @@ function DocumentScene({
+   const { team, user } = auth;
+ 
+   const editorRef = useRef<TEditor>(null);
++  const mainRef = useRef<HTMLDivElement>(null);
+ 
+   const {
+     isUploading,
+@@ -298,6 +301,11 @@ function DocumentScene({
+     [document, dialogs, t, onSave]
+   );
+ 
++  const handleChangeTocShown = useCallback(
++    (shown: boolean) => ui.set({ tocVisible: shown }),
++    [ui]
++  );
++
+   const goBack = useCallback(() => {
+     if (!readOnly) {
+       history.push({
+@@ -431,7 +439,9 @@ function DocumentScene({
+               onSave={onSave}
+             />
+           )}
++          <DocumentZoom key={document.id} targetRef={mainRef} />
+           <Main
++            ref={mainRef}
+             fullWidth={document.fullWidth}
+             tocPosition={tocPos}
+             style={fullWidthTransformOffsetStyle}
+@@ -470,34 +480,44 @@ function DocumentScene({
+                         <Contents />
+                       </PrintContentsContainer>
+                     )}
+-                    <Editor
+-                      id={document.id}
+-                      key={embedsDisabled ? "disabled" : "enabled"}
+-                      ref={editorRef}
+-                      multiplayer={multiplayerEditor}
+-                      isDraft={document.isDraft}
++                    <DocumentEditorContextMenu
+                       document={document}
+-                      value={readOnly ? document.data : undefined}
+-                      defaultValue={document.data}
+-                      embedsDisabled={embedsDisabled}
+-                      onSynced={onSynced}
+-                      onFileUploadStart={onFileUploadStart}
+-                      onFileUploadStop={onFileUploadStop}
+-                      onCreateLink={onCreateLink}
+-                      onChangeTitle={handleChangeTitle}
+-                      onChangeIcon={handleChangeIcon}
+-                      onSave={onSave}
+-                      onPublish={onPublish}
+-                      onCancel={goBack}
++                      editorRef={editorRef}
+                       readOnly={readOnly}
+-                      canUpdate={abilities.update}
+-                      canComment={abilities.comment}
+-                      autoFocus={document.isJustCreated}
++                      isShare={isShare}
++                      abilities={abilities}
++                      tocShown={!!showContents}
++                      onChangeTocShown={handleChangeTocShown}
+                     >
+-                      <ReferencesWrapper>
+-                        <References document={document} />
+-                      </ReferencesWrapper>
+-                    </Editor>
++                      <Editor
++                        id={document.id}
++                        key={embedsDisabled ? "disabled" : "enabled"}
++                        ref={editorRef}
++                        multiplayer={multiplayerEditor}
++                        isDraft={document.isDraft}
++                        document={document}
++                        value={readOnly ? document.data : undefined}
++                        defaultValue={document.data}
++                        embedsDisabled={embedsDisabled}
++                        onSynced={onSynced}
++                        onFileUploadStart={onFileUploadStart}
++                        onFileUploadStop={onFileUploadStop}
++                        onCreateLink={onCreateLink}
++                        onChangeTitle={handleChangeTitle}
++                        onChangeIcon={handleChangeIcon}
++                        onSave={onSave}
++                        onPublish={onPublish}
++                        onCancel={goBack}
++                        readOnly={readOnly}
++                        canUpdate={abilities.update}
++                        canComment={abilities.comment}
++                        autoFocus={document.isJustCreated}
++                      >
++                        <ReferencesWrapper>
++                          <References document={document} />
++                        </ReferencesWrapper>
++                      </Editor>
++                    </DocumentEditorContextMenu>
+                   </>
+                 )}
+               </MeasuredContainer>
+@@ -525,6 +545,8 @@ type MainProps = {
+ 
+ const Main = styled.div<MainProps>`
+   margin-top: 4px;
++  /* View-only document zoom (KMS patch 0006), set by DocumentZoom. */
++  zoom: var(--kms-doc-zoom, 1);
+ 
+   ${breakpoint("tablet")`
+     display: grid;
+@@ -547,6 +569,7 @@ const Main = styled.div<MainProps>`
+ 
+   @media print {
+     display: block;
++    zoom: 1;
+     max-width: ${({ fullWidth }: MainProps) =>
+       fullWidth
+         ? `100%`
+diff --git a/app/scenes/Document/components/DocumentEditorContextMenu.tsx b/app/scenes/Document/components/DocumentEditorContextMenu.tsx
+new file mode 100644
+index 0000000..d7a5896
+--- /dev/null
++++ b/app/scenes/Document/components/DocumentEditorContextMenu.tsx
+@@ -0,0 +1,369 @@
++/**
++ * Right-click menu for the document area (title and editor), built on the
++ * action system. Shift+right-click keeps the browser's own menu; on mobile the
++ * native long-press menu is used. The ContextMenu key and Shift+F10 open the
++ * menu at the caret. The menu scales with the document zoom (patch 0006).
++ *
++ * VERSION: 1.0 (2026-10-11) — KMS patch 0006
++ */
++import { observer } from "mobx-react";
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import styled from "styled-components";
++import { isCode } from "@shared/editor/lib/isCode";
++import type Document from "~/models/Document";
++import { actionToMenuItem, resolve } from "~/actions";
++import {
++  createDocumentEditorMenuAction,
++  type DocumentEditorMenuTarget,
++} from "~/actions/definitions/documentEditor";
++import { toMenuItems } from "~/components/Menu/transformer";
++import { Menu, MenuContent, MenuTrigger } from "~/components/primitives/Menu";
++import { MenuProvider } from "~/components/primitives/Menu/MenuContext";
++import type { Editor as TEditor } from "~/editor";
++import useActionContext, {
++  ActionContextProvider,
++} from "~/hooks/useActionContext";
++import { useComputed } from "~/hooks/useComputed";
++import { useDocumentActiveModels } from "~/hooks/useDocumentActiveModels";
++import useMobile from "~/hooks/useMobile";
++import type { ActionVariant } from "~/types";
++import { preventDefault } from "~/utils/events";
++
++type Props = {
++  /** The document shown in the area. */
++  document: Document;
++  /** The editor of the document body. */
++  editorRef: React.RefObject<TEditor | null>;
++  /** Whether the document is shown read-only. */
++  readOnly: boolean;
++  /** Whether this is the public shared view. */
++  isShare: boolean;
++  /** Permissions of the current user on the document. */
++  abilities: Record<string, boolean>;
++  /** Whether the table of contents is shown. */
++  tocShown: boolean;
++  /** Shows or hides the table of contents. */
++  onChangeTocShown: (shown: boolean) => void;
++  /** The document area (title and editor). */
++  children: React.ReactNode;
++};
++
++/** How long a native contextmenu right after a keyboard open is ignored. */
++const KEYBOARD_ECHO_MS = 800;
++
++/**
++ * Find the position of the closest ancestor of `pos` matching `predicate`.
++ *
++ * @param doc The document.
++ * @param pos A position inside the document.
++ * @param predicate The node test.
++ * @returns The position before the matching node, or null.
++ */
++function findAncestorPos(
++  doc: ProsemirrorNode,
++  pos: number,
++  predicate: (node: ProsemirrorNode) => boolean
++): number | null {
++  const $pos = doc.resolve(Math.max(0, Math.min(pos, doc.content.size)));
++  for (let depth = $pos.depth; depth > 0; depth--) {
++    if (predicate($pos.node(depth))) {
++      return $pos.before(depth);
++    }
++  }
++  return null;
++}
++
++function DocumentEditorContextMenuInner({
++  document,
++  editorRef,
++  readOnly,
++  isShare,
++  abilities,
++  tocShown,
++  onChangeTocShown,
++  children,
++}: Props) {
++  const { t } = useTranslation();
++  const isMobile = useMobile();
++  const actionContext = useActionContext({ isMenu: true });
++  const [open, setOpen] = React.useState(false);
++  const [target, setTarget] = React.useState<DocumentEditorMenuTarget | null>(
++    null
++  );
++  const [host, setHost] = React.useState<HTMLDivElement | null>(null);
++  const keyboardOpenAt = React.useRef(0);
++  const keyboardPending = React.useRef(false);
++
++  const limited = isShare || !abilities.update;
++
++  const buildTarget = React.useCallback(
++    (event: React.MouseEvent): DocumentEditorMenuTarget => {
++      const editor = editorRef.current;
++      const view = editor?.view;
++      const element =
++        event.target instanceof Element ? event.target : undefined;
++      const inEditor = !!view && !!element && view.dom.contains(element);
++      const fromKeyboard = keyboardPending.current;
++      keyboardPending.current = false;
++
++      let pos: number | null = null;
++      let inside = -1;
++      if (inEditor && view) {
++        if (fromKeyboard) {
++          pos = view.state.selection.head;
++        } else {
++          const found = view.posAtCoords({
++            left: event.clientX,
++            top: event.clientY,
++          });
++          pos = found ? found.pos : view.state.selection.head;
++          inside = found?.inside ?? -1;
++        }
++      }
++
++      let tableCellPos: number | null = null;
++      let imagePos: number | null = null;
++      let codePos: number | null = null;
++      let headingPos: number | null = null;
++      let blockDir: "rtl" | "ltr" | null = null;
++
++      if (view && pos !== null) {
++        const { doc } = view.state;
++        tableCellPos = findAncestorPos(doc, pos, (node) => {
++          const role = node.type.spec.tableRole;
++          return role === "cell" || role === "header_cell";
++        });
++        codePos = findAncestorPos(doc, pos, isCode);
++
++        const image = element?.closest("img");
++        const candidates = [inside];
++        if (image && view.dom.contains(image)) {
++          try {
++            const domPos = view.posAtDOM(image, 0);
++            candidates.push(domPos, domPos - 1);
++          } catch {
++            // The image is not part of the document (e.g. a widget).
++          }
++        }
++        imagePos =
++          candidates.find(
++            (candidate) =>
++              candidate >= 0 && doc.nodeAt(candidate)?.type.name === "image"
++          ) ?? null;
++
++        doc.descendants((node, nodePos) => {
++          if (nodePos > pos!) {
++            return false;
++          }
++          if (node.type.name === "heading") {
++            headingPos = nodePos;
++          }
++          return true;
++        });
++
++        const dir = doc.resolve(pos).parent.attrs.dir;
++        blockDir = dir === "rtl" || dir === "ltr" ? dir : null;
++      }
++
++      const domSelection = window.getSelection();
++      const savedRange =
++        domSelection && domSelection.rangeCount > 0
++          ? domSelection.getRangeAt(0).cloneRange()
++          : null;
++      const editableElement = element?.closest<HTMLElement>(
++        '[contenteditable="true"]'
++      );
++      const selectionText = domSelection?.toString() ?? "";
++      const hasSelection =
++        inEditor && view
++          ? !view.state.selection.empty
++          : selectionText.length > 0;
++
++      const restoreSelection = () => {
++        if (inEditor && view && view.editable) {
++          view.focus();
++          return;
++        }
++        editableElement?.focus({ preventScroll: true });
++        if (savedRange) {
++          const selection = window.getSelection();
++          selection?.removeAllRanges();
++          selection?.addRange(savedRange);
++        }
++      };
++
++      return {
++        document,
++        editor: editor ?? null,
++        inEditor,
++        pos,
++        editable: !!view?.editable && !readOnly,
++        limited,
++        isShare,
++        canUpdate: !!abilities.update,
++        canComment: !!abilities.comment,
++        hasSelection,
++        selectionText,
++        titleEditable: !inEditor && !!editableElement && !readOnly,
++        restoreSelection,
++        tableCellPos,
++        imagePos,
++        codePos,
++        headingPos,
++        blockDir,
++        tocShown,
++        setTocShown: onChangeTocShown,
++      };
++    },
++    [
++      editorRef,
++      document,
++      readOnly,
++      limited,
++      isShare,
++      abilities.update,
++      abilities.comment,
++      tocShown,
++      onChangeTocShown,
++    ]
++  );
++
++  const handleContextMenuCapture = React.useCallback(
++    (event: React.MouseEvent) => {
++      if (isMobile) {
++        return;
++      }
++      // Shift+right-click: leave the event to the browser's own menu.
++      if (event.shiftKey) {
++        event.stopPropagation();
++        return;
++      }
++      // A browser that also fires its own contextmenu for the key press.
++      if (
++        event.isTrusted &&
++        !keyboardPending.current &&
++        Date.now() - keyboardOpenAt.current < KEYBOARD_ECHO_MS
++      ) {
++        event.preventDefault();
++        event.stopPropagation();
++        return;
++      }
++      setTarget(buildTarget(event));
++    },
++    [isMobile, buildTarget]
++  );
++
++  const handleKeyDown = React.useCallback(
++    (event: React.KeyboardEvent) => {
++      if (
++        isMobile ||
++        !(event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))
++      ) {
++        return;
++      }
++      const element =
++        event.target instanceof HTMLElement ? event.target : undefined;
++      if (!element) {
++        return;
++      }
++      event.preventDefault();
++      const view = editorRef.current?.view;
++      let x: number;
++      let y: number;
++      if (view && view.dom.contains(element)) {
++        const coords = view.coordsAtPos(view.state.selection.head);
++        x = coords.left;
++        y = coords.bottom;
++      } else {
++        const rect = element.getBoundingClientRect();
++        x = rect.left + Math.min(16, rect.width / 2);
++        y = rect.top + Math.min(16, rect.height / 2);
++      }
++      keyboardPending.current = true;
++      keyboardOpenAt.current = Date.now();
++      element.dispatchEvent(
++        new MouseEvent("contextmenu", {
++          bubbles: true,
++          cancelable: true,
++          clientX: x,
++          clientY: y,
++          button: 2,
++        })
++      );
++      keyboardPending.current = false;
++    },
++    [isMobile, editorRef]
++  );
++
++  const menuItems = useComputed(() => {
++    if (!open || !target) {
++      return [];
++    }
++    const root = createDocumentEditorMenuAction(target);
++    return resolve<ActionVariant[]>(root.children, actionContext).map(
++      (action) => actionToMenuItem(action, actionContext)
++    );
++  }, [open, target, actionContext]);
++
++  const content = open ? toMenuItems(menuItems) : null;
++
++  return (
++    <MenuProvider variant="context" container={host}>
++      <Menu open={open} onOpenChange={setOpen}>
++        <MenuTrigger disabled={isMobile}>
++          <Area
++            onContextMenuCapture={handleContextMenuCapture}
++            onKeyDown={handleKeyDown}
++          >
++            {children}
++            <MenuHost ref={setHost} />
++          </Area>
++        </MenuTrigger>
++        <MenuContent
++          aria-label={t("Document")}
++          onCloseAutoFocus={preventDefault}
++        >
++          {content}
++        </MenuContent>
++      </Menu>
++    </MenuProvider>
++  );
++}
++
++/**
++ * Wraps the document area in its right-click menu.
++ */
++function DocumentEditorContextMenu(props: Props) {
++  const activeModels = useDocumentActiveModels(props.document);
++
++  return (
++    <ActionContextProvider value={{ activeModels }}>
++      <DocumentEditorContextMenuInner {...props} />
++    </ActionContextProvider>
++  );
++}
++
++/** Takes no box of its own, so the document layout is unchanged. */
++const Area = styled.div`
++  display: contents;
++`;
++
++/**
++ * Menus are portaled here: the host undoes the document zoom so they are
++ * positioned in viewport px, and their content is zoomed again (patch 0006).
++ */
++const MenuHost = styled.div`
++  zoom: calc(1 / var(--kms-doc-zoom, 1));
++
++  & > * > * {
++    zoom: var(--kms-doc-zoom, 1);
++  }
++
++  @media print {
++    display: none;
++  }
++`;
++
++export default observer(DocumentEditorContextMenu);
+diff --git a/app/scenes/Document/components/DocumentZoom.tsx b/app/scenes/Document/components/DocumentZoom.tsx
+new file mode 100644
+index 0000000..11a2d9d
+--- /dev/null
++++ b/app/scenes/Document/components/DocumentZoom.tsx
+@@ -0,0 +1,280 @@
++/**
++ * View-only document zoom: Ctrl+wheel, trackpad pinch and Ctrl/Cmd + = - 0.
++ * The zoom is never saved; each document opens at 100%.
++ *
++ * VERSION: 1.1 (2026-10-11) — KMS patch 0006
++ */
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import styled from "styled-components";
++import { HEADER_HEIGHT } from "@shared/constants";
++import { depths, s } from "@shared/styles";
++import { unicodeCLDRtoBCP47 } from "@shared/utils/date";
++import { metaDisplay } from "@shared/utils/keyboard";
++import {
++  DOC_ZOOM_VAR,
++  clampDocZoom,
++  stepDocZoom,
++} from "@shared/utils/zoom";
++import Tooltip from "~/components/Tooltip";
++import useMobile from "~/hooks/useMobile";
++
++type Props = {
++  /** The element that receives the zoom (the document's Main column). */
++  targetRef: React.RefObject<HTMLElement | null>;
++};
++
++/** Wheel deltas below this (in pixels) are treated as a continuous pinch. */
++const PINCH_DELTA_LIMIT = 40;
++
++/** How strongly a pinch delta changes the zoom. */
++const PINCH_SENSITIVITY = 0.01;
++
++/** Zoom commands for other parts of the document page, e.g. its context menu. */
++export type DocumentZoomControls = {
++  zoomIn: () => void;
++  zoomOut: () => void;
++  reset: () => void;
++  getZoom: () => number;
++};
++
++let activeControls: DocumentZoomControls | null = null;
++
++/**
++ * Returns the zoom controls of the document that is open, if any.
++ *
++ * @returns The controls, or null when no document zoom is mounted.
++ */
++export function getDocumentZoomControls(): DocumentZoomControls | null {
++  return activeControls;
++}
++
++const ZOOM_IN_CODES = new Set(["Equal", "NumpadAdd"]);
++const ZOOM_OUT_CODES = new Set(["Minus", "NumpadSubtract"]);
++const ZOOM_RESET_CODES = new Set(["Digit0", "Numpad0"]);
++
++/**
++ * Find the element that scrolls the given element vertically.
++ *
++ * @param el The element inside the scroll container.
++ * @returns The scrolling ancestor, or the document scrolling element.
++ */
++function getScrollParent(el: HTMLElement): HTMLElement {
++  let node: HTMLElement | null = el.parentElement;
++  while (node && node !== document.body) {
++    const { overflowY } = window.getComputedStyle(node);
++    if (
++      (overflowY === "auto" || overflowY === "scroll") &&
++      node.scrollHeight > node.clientHeight
++    ) {
++      return node;
++    }
++    node = node.parentElement;
++  }
++  return (document.scrollingElement as HTMLElement) ?? document.documentElement;
++}
++
++/**
++ * Renders the zoom badge and owns the zoom input listeners for one document.
++ * Mount it with `key={document.id}` so another document starts at 100%.
++ */
++function DocumentZoom({ targetRef }: Props) {
++  const { t, i18n } = useTranslation();
++  const isMobile = useMobile();
++  const zoomRef = React.useRef(1);
++  const [zoom, setZoom] = React.useState(1);
++
++  /**
++   * Apply a new zoom, keeping the content at `anchorY` (viewport px) in place.
++   * When no anchor is given the top of the visible text stays in place.
++   */
++  const applyZoom = React.useCallback(
++    (requested: number, anchorY?: number) => {
++      const target = targetRef.current;
++      if (!target) {
++        return;
++      }
++      const previous = zoomRef.current;
++      const next = clampDocZoom(requested);
++      if (next === previous) {
++        return;
++      }
++
++      const scroller = getScrollParent(target);
++      const isDocumentScroller =
++        scroller === document.scrollingElement ||
++        scroller === document.documentElement;
++      const scrollerTop = isDocumentScroller
++        ? 0
++        : scroller.getBoundingClientRect().top;
++      const rect = target.getBoundingClientRect();
++      const y =
++        anchorY ?? Math.max(rect.top, scrollerTop + HEADER_HEIGHT);
++      // Distance of the anchor from the top of Main, in unzoomed CSS px.
++      const offset = Math.max(0, (y - rect.top) / previous);
++
++      zoomRef.current = next;
++      if (next === 1) {
++        target.style.removeProperty(DOC_ZOOM_VAR);
++      } else {
++        target.style.setProperty(DOC_ZOOM_VAR, String(next));
++      }
++      // Main's top does not move with its own zoom, so the anchored point
++      // moved by offset * (next - previous); scroll by the same amount.
++      scroller.scrollTop += offset * (next - previous);
++      setZoom(next);
++    },
++    [targetRef]
++  );
++
++  const reset = React.useCallback(() => applyZoom(1), [applyZoom]);
++
++  React.useEffect(() => {
++    const controls: DocumentZoomControls = {
++      zoomIn: () => applyZoom(stepDocZoom(zoomRef.current, 1)),
++      zoomOut: () => applyZoom(stepDocZoom(zoomRef.current, -1)),
++      reset: () => applyZoom(1),
++      getZoom: () => zoomRef.current,
++    };
++    activeControls = controls;
++    return () => {
++      if (activeControls === controls) {
++        activeControls = null;
++      }
++    };
++  }, [applyZoom]);
++
++  React.useEffect(() => {
++    if (isMobile) {
++      return;
++    }
++
++    const handleWheel = (event: WheelEvent) => {
++      // Trackpad pinch arrives as a wheel event with ctrlKey set.
++      if (!event.ctrlKey) {
++        return;
++      }
++      event.preventDefault();
++      const current = zoomRef.current;
++      const isPinch =
++        event.deltaMode === 0 && Math.abs(event.deltaY) < PINCH_DELTA_LIMIT;
++      const next = isPinch
++        ? current * Math.exp(-event.deltaY * PINCH_SENSITIVITY)
++        : event.deltaY === 0
++          ? current
++          : stepDocZoom(current, event.deltaY < 0 ? 1 : -1);
++      applyZoom(next, event.clientY);
++    };
++
++    const handleKeyDown = (event: KeyboardEvent) => {
++      if (!(event.ctrlKey || event.metaKey) || event.altKey) {
++        return;
++      }
++      const { code } = event;
++      let next: number | undefined;
++      if (ZOOM_IN_CODES.has(code)) {
++        // "+" needs Shift on many layouts, so Shift is allowed here only.
++        next = stepDocZoom(zoomRef.current, 1);
++      } else if (event.shiftKey) {
++        // Ctrl+Shift+Minus (horizontal rule) and Ctrl+Shift+0 (paragraph)
++        // belong to the editor.
++        return;
++      } else if (ZOOM_OUT_CODES.has(code)) {
++        next = stepDocZoom(zoomRef.current, -1);
++      } else if (ZOOM_RESET_CODES.has(code)) {
++        next = 1;
++      }
++      if (next === undefined) {
++        return;
++      }
++      event.preventDefault();
++      event.stopPropagation();
++      applyZoom(next);
++    };
++
++    window.addEventListener("wheel", handleWheel, { passive: false });
++    window.addEventListener("keydown", handleKeyDown, true);
++    return () => {
++      window.removeEventListener("wheel", handleWheel);
++      window.removeEventListener("keydown", handleKeyDown, true);
++    };
++  }, [isMobile, applyZoom]);
++
++  // Leaving the document (unmount) always returns to 100%.
++  React.useEffect(() => {
++    const target = targetRef.current;
++    return () => {
++      target?.style.removeProperty(DOC_ZOOM_VAR);
++    };
++  }, [targetRef]);
++
++  const label = React.useMemo(() => {
++    let locale: string | undefined;
++    try {
++      locale = unicodeCLDRtoBCP47(i18n.language || "en_US");
++    } catch {
++      locale = undefined;
++    }
++    return new Intl.NumberFormat(locale, {
++      style: "percent",
++      maximumFractionDigits: 0,
++    }).format(zoom);
++  }, [zoom, i18n.language]);
++
++  if (zoom === 1) {
++    return null;
++  }
++
++  return (
++    <BadgeAnchor>
++      <Tooltip content={t("Reset zoom")} shortcut={`${metaDisplay}+0`}>
++        <Badge
++          type="button"
++          onClick={reset}
++          aria-label={`${t("Document zoom")} ${label}. ${t("Reset zoom")}`}
++        >
++          {label}
++        </Badge>
++      </Tooltip>
++    </BadgeAnchor>
++  );
++}
++
++const BadgeAnchor = styled.div`
++  position: sticky;
++  top: ${HEADER_HEIGHT + 8}px;
++  height: 0;
++  z-index: ${depths.toc};
++  pointer-events: none;
++
++  @media print {
++    display: none;
++  }
++`;
++
++const Badge = styled.button`
++  position: absolute;
++  top: 0;
++  inset-inline-end: 16px;
++  pointer-events: auto;
++  cursor: var(--pointer);
++  padding: 2px 8px;
++  border: 1px solid ${s("divider")};
++  border-radius: 12px;
++  background: ${s("menuBackground")};
++  color: ${s("textSecondary")};
++  box-shadow: ${s("menuShadow")};
++  font-size: 12px;
++  font-variant-numeric: tabular-nums;
++  line-height: 18px;
++
++  &:hover {
++    color: ${s("text")};
++  }
++
++  @media print {
++    display: none;
++  }
++`;
++
++export default DocumentZoom;
+diff --git a/app/scenes/Document/components/ImageAltTextDialog.tsx b/app/scenes/Document/components/ImageAltTextDialog.tsx
+new file mode 100644
+index 0000000..9975585
+--- /dev/null
++++ b/app/scenes/Document/components/ImageAltTextDialog.tsx
+@@ -0,0 +1,50 @@
++/**
++ * Dialog to edit the alternative text of an image.
++ *
++ * VERSION: 1.0 (2026-10-11) — KMS patch 0006
++ */
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import Button from "~/components/Button";
++import Flex from "~/components/Flex";
++import Input from "~/components/Input";
++
++type Props = {
++  /** The current alt text. */
++  initialValue: string;
++  /** Called with the new alt text (may be empty). */
++  onSubmit: (alt: string) => void;
++};
++
++function ImageAltTextDialog({ initialValue, onSubmit }: Props) {
++  const { t } = useTranslation();
++  const [value, setValue] = React.useState(initialValue);
++
++  const handleSubmit = React.useCallback(
++    (ev: React.SyntheticEvent) => {
++      ev.preventDefault();
++      onSubmit(value.trim());
++    },
++    [onSubmit, value]
++  );
++
++  return (
++    <form onSubmit={handleSubmit}>
++      <Flex column>
++        <Input
++          type="text"
++          label={t("Alt text")}
++          onChange={(ev) => setValue(ev.target.value)}
++          value={value}
++          autoSelect
++          flex
++        />
++      </Flex>
++      <Flex justify="flex-end">
++        <Button type="submit">{t("Save")}</Button>
++      </Flex>
++    </form>
++  );
++}
++
++export default ImageAltTextDialog;
+diff --git a/app/scenes/Settings/Preferences.tsx b/app/scenes/Settings/Preferences.tsx
+index a02d17e..99d2cc9 100644
+--- a/app/scenes/Settings/Preferences.tsx
++++ b/app/scenes/Settings/Preferences.tsx
+@@ -28,6 +28,7 @@ import useUserCalendar from "~/hooks/useUserCalendar";
+ import useUserDateFormat from "~/hooks/useUserDateFormat";
+ import UserDelete from "../UserDelete";
+ import { AutoLaunchSetting } from "./components/AutoLaunchSetting";
++import InterfaceZoomSetting from "./components/InterfaceZoomSetting";
+ import SettingRow from "./components/SettingRow";
+ 
+ function Preferences() {
+@@ -317,6 +318,7 @@ function Preferences() {
+           labelHidden
+         />
+       </SettingRow>
++      <InterfaceZoomSetting />
+       <SettingRow
+         name={UserPreference.UseCursorPointer}
+         label={t("Use pointer cursor")}
+diff --git a/app/scenes/Settings/components/InterfaceZoomSetting.tsx b/app/scenes/Settings/components/InterfaceZoomSetting.tsx
+new file mode 100644
+index 0000000..f9cbae9
+--- /dev/null
++++ b/app/scenes/Settings/components/InterfaceZoomSetting.tsx
+@@ -0,0 +1,81 @@
++/**
++ * Settings → Preferences row for the sidebar zoom.
++ *
++ * VERSION: 1.0 (2026-10-11) — KMS patch 0006
++ */
++import { observer } from "mobx-react";
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++import { toast } from "sonner";
++import { UserPreference } from "@shared/types";
++import { unicodeCLDRtoBCP47 } from "@shared/utils/date";
++import { INTERFACE_ZOOM_CHOICES } from "@shared/utils/zoom";
++import type { Option } from "~/components/InputSelect";
++import { InputSelect } from "~/components/InputSelect";
++import useCurrentUser from "~/hooks/useCurrentUser";
++import SettingRow from "./SettingRow";
++
++function InterfaceZoomSetting() {
++  const { t, i18n } = useTranslation();
++  const user = useCurrentUser();
++  const current = Number(user.getPreference(UserPreference.InterfaceZoom, 1));
++  const value = INTERFACE_ZOOM_CHOICES.includes(
++    current as (typeof INTERFACE_ZOOM_CHOICES)[number]
++  )
++    ? current
++    : 1;
++
++  const options: Option[] = React.useMemo(() => {
++    let locale: string | undefined;
++    try {
++      locale = unicodeCLDRtoBCP47(user.language || i18n.language || "en_US");
++    } catch {
++      locale = undefined;
++    }
++    const format = new Intl.NumberFormat(locale, {
++      style: "percent",
++      maximumFractionDigits: 0,
++    });
++    return INTERFACE_ZOOM_CHOICES.map(
++      (choice) =>
++        ({
++          type: "item",
++          label: format.format(choice),
++          value: String(choice),
++        }) satisfies Option
++    );
++  }, [user.language, i18n.language]);
++
++  const handleChange = React.useCallback(
++    async (next: string) => {
++      const zoom = Number(next);
++      if (!Number.isFinite(zoom)) {
++        return;
++      }
++      user.setPreference(UserPreference.InterfaceZoom, zoom);
++      await user.save();
++      toast.success(t("Preferences saved"));
++    },
++    [user, t]
++  );
++
++  return (
++    <SettingRow
++      name={UserPreference.InterfaceZoom}
++      label={t("Sidebar size")}
++      description={t(
++        "Zoom level of the side menu. Documents are zoomed with Ctrl + mouse wheel or Ctrl with +, - and 0."
++      )}
++    >
++      <InputSelect
++        options={options}
++        value={String(value)}
++        onChange={handleChange}
++        label={t("Sidebar size")}
++        labelHidden
++      />
++    </SettingRow>
++  );
++}
++
++export default observer(InterfaceZoomSetting);
+diff --git a/server/routes/api/users/schema.ts b/server/routes/api/users/schema.ts
+index 360635f..20a8946 100644
+--- a/server/routes/api/users/schema.ts
++++ b/server/routes/api/users/schema.ts
+@@ -9,6 +9,7 @@ import {
+   UserRole,
+ } from "@shared/types";
+ import { locales } from "@shared/utils/date";
++import { INTERFACE_ZOOM_MAX, INTERFACE_ZOOM_MIN } from "@shared/utils/zoom";
+ import {
+   UsersFilterListSchema,
+   UserStatusFilters,
+@@ -133,6 +134,10 @@ export const UsersUpdateSchema = BaseSchema.extend({
+         [UserPreference.SidebarSectionOrder]: z.array(z.enum(SidebarSection)),
+         [UserPreference.Calendar]: z.enum(CalendarType),
+         [UserPreference.DateFormat]: z.enum(DateFormatType),
++        [UserPreference.InterfaceZoom]: z
++          .number()
++          .min(INTERFACE_ZOOM_MIN)
++          .max(INTERFACE_ZOOM_MAX),
+       })
+       .partial()
+       .optional(),
+diff --git a/shared/types/user.ts b/shared/types/user.ts
+index 1eeffe5..b22ca0c 100644
+--- a/shared/types/user.ts
++++ b/shared/types/user.ts
+@@ -36,6 +36,8 @@ export enum UserPreference {
+   Calendar = "calendar",
+   /** How dates are written in the Persian calendar. */
+   DateFormat = "dateFormat",
++  /** Zoom factor of the sidebar, 0.8 to 1.5 (KMS patch 0006). */
++  InterfaceZoom = "interfaceZoom",
+ }
+ 
+ export enum DateFormatType {
+@@ -100,4 +102,5 @@ export type UserPreferences = {
+   [UserPreference.SidebarSectionOrder]?: SidebarSection[];
+   [UserPreference.Calendar]?: CalendarType;
+   [UserPreference.DateFormat]?: DateFormatType;
++  [UserPreference.InterfaceZoom]?: number;
+ };
+diff --git a/shared/utils/zoom.ts b/shared/utils/zoom.ts
+new file mode 100644
+index 0000000..b489c91
+--- /dev/null
++++ b/shared/utils/zoom.ts
+@@ -0,0 +1,75 @@
++/**
++ * Document and interface zoom helpers.
++ *
++ * VERSION: 1.0 (2026-10-11) — KMS patch 0006
++ */
++
++/** CSS custom property holding the view-only zoom of the open document. */
++export const DOC_ZOOM_VAR = "--kms-doc-zoom";
++
++/** Smallest document zoom. */
++export const DOC_ZOOM_MIN = 0.5;
++
++/** Largest document zoom. */
++export const DOC_ZOOM_MAX = 2;
++
++/** Step used by the mouse wheel and the keyboard. */
++export const DOC_ZOOM_STEP = 0.1;
++
++/** Choices offered for the sidebar ("interface") zoom in Preferences. */
++export const INTERFACE_ZOOM_CHOICES = [0.8, 0.9, 1, 1.1, 1.25, 1.5] as const;
++
++/** Smallest accepted interface zoom, shared with the API validation. */
++export const INTERFACE_ZOOM_MIN = 0.8;
++
++/** Largest accepted interface zoom, shared with the API validation. */
++export const INTERFACE_ZOOM_MAX = 1.5;
++
++/**
++ * Clamp a document zoom to the allowed range and round it to whole percent.
++ *
++ * @param zoom The requested zoom factor.
++ * @returns The zoom factor within range, rounded to 1%.
++ */
++export function clampDocZoom(zoom: number): number {
++  if (!Number.isFinite(zoom)) {
++    return 1;
++  }
++  const rounded = Math.round(zoom * 100) / 100;
++  return Math.min(DOC_ZOOM_MAX, Math.max(DOC_ZOOM_MIN, rounded));
++}
++
++/**
++ * Move one step up or down from the current zoom, snapped to the step grid
++ * (for example 1.07 steps up to 1.1 and down to 1.0).
++ *
++ * @param zoom The current zoom factor.
++ * @param direction 1 to zoom in, -1 to zoom out.
++ * @returns The next zoom factor on the grid, clamped to the range.
++ */
++export function stepDocZoom(zoom: number, direction: 1 | -1): number {
++  const steps = zoom / DOC_ZOOM_STEP;
++  const epsilon = 1e-6;
++  const next =
++    direction > 0
++      ? Math.floor(steps + epsilon) + 1
++      : Math.ceil(steps - epsilon) - 1;
++  return clampDocZoom(next * DOC_ZOOM_STEP);
++}
++
++/**
++ * Read the document zoom that applies to an element, from the inherited CSS
++ * custom property. Elements outside a zoomed document return 1.
++ *
++ * @param el The element to read from.
++ * @returns The zoom factor, 1 when unset.
++ */
++export function getDocZoom(el?: Element | null): number {
++  if (!el || typeof window === "undefined") {
++    return 1;
++  }
++  const value = parseFloat(
++    window.getComputedStyle(el).getPropertyValue(DOC_ZOOM_VAR)
++  );
++  return Number.isFinite(value) && value > 0 ? value : 1;
++}

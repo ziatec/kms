@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Thu, 15 Oct 2026 17:00:00 +0330
+Subject: [PATCH 12/18] fix: sidebar in Firefox: auto-hide with the RTL interface, rename by double click
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.1 (2026-10-16)  2.1: rename by double click in Firefox also for documents
+  inside a collection (and starred / shared rows): the collection around its documents
+  is draggable too, so the input stayed locked to the mouse (only the keyboard worked).
+  While a title is edited, every draggable ancestor of the input is made non-draggable
+  and restored afterwards (EditableTitle).
+  2.0 = + rename by double click in Firefox (old 0018).
+  Before: 1.0 (2026-10-14)
+Root: build/outline-1.11.0 (apply after 0001..0011)
+
+Problem: with Auto-hide on in the Persian (RTL) interface, Firefox hid the menu
+items when the pointer left the sidebar, but the sidebar background stayed on
+screen and covered part of the document. LTR in Firefox and both directions in
+Chrome were fine.
+
+Cause: the collapsed sidebar was hidden with a percentage translateX
+(calc(100% - 8px) in RTL, calc(-100% + 16px) in LTR) that Firefox did not
+resolve correctly for the RTL, zoomed (patch 0006) fixed-position sidebar.
+
+Fix: a collapsed sidebar is moved off screen with a plain pixel offset on
+inset-inline-start (set inline by Sidebar.tsx, divided by the interface zoom
+like the width) and the transform is no longer used for hiding. Hover and
+focus-within reveal it by forcing inset-inline-start: 0 (!important), as before
+with transform. The visible edge strip is unchanged (16px LTR, 8px RTL or inset
+title bar). Mobile (drawer) is unchanged.
+
+Rename a sidebar title by double click (was 0018 v1.0):
+Problem: in Firefox, double-click on a document title in the sidebar selects
+the text but the rename input does not take the caret/selection, so it cannot
+be renamed. Chrome works.
+
+Cause: the sidebar row is draggable (react-dnd sets draggable=true). Firefox
+cannot place the caret or select text in an input inside a draggable element.
+
+Fix: while the title is being edited, the drag source is not connected, so the
+row loses draggable and the input behaves normally.
+
+Files (3; N = new, M = modified, D = deleted):
+  M app/components/EditableTitle.tsx
+  M app/components/Sidebar/Sidebar.tsx
+  M app/components/Sidebar/components/DocumentLink.tsx
+
+---
+---
+
+diff --git a/app/components/EditableTitle.tsx b/app/components/EditableTitle.tsx
+index 9709f3e..9b6e60b 100644
+--- a/app/components/EditableTitle.tsx
++++ b/app/components/EditableTitle.tsx
+@@ -41,6 +41,34 @@ function EditableTitle({
+   const [originalValue, setOriginalValue] = React.useState(title);
+   const [value, setValue] = React.useState(title);
+   const [isSubmitting, setIsSubmitting] = React.useState(false);
++  const inputRef = React.useRef<HTMLInputElement>(null);
++
++  // KMS patch 0012 v2.1: Firefox cannot place the caret or select text with
++  // the mouse in an input that has a draggable ancestor (Chrome can). Sidebar
++  // rows, and the collection around its documents, are draggable, so while
++  // the title is edited every draggable ancestor is made non-draggable, and
++  // restored afterwards.
++  React.useEffect(() => {
++    if (!isEditing) {
++      return;
++    }
++    const changed: HTMLElement[] = [];
++    let node = inputRef.current?.parentElement ?? null;
++    while (node) {
++      if (node.getAttribute("draggable") === "true") {
++        node.setAttribute("draggable", "false");
++        changed.push(node);
++      }
++      node = node.parentElement;
++    }
++    return () => {
++      changed.forEach((element) => {
++        if (element.isConnected) {
++          element.setAttribute("draggable", "true");
++        }
++      });
++    };
++  }, [isEditing]);
+ 
+   React.useImperativeHandle(ref, () => ({
+     setIsEditing,
+@@ -151,6 +179,7 @@ function EditableTitle({
+       {isEditing ? (
+         <EventBoundary as="form" onSubmit={handleSave}>
+           <Input
++            ref={inputRef}
+             dir="auto"
+             type="text"
+             lang=""
+diff --git a/app/components/Sidebar/Sidebar.tsx b/app/components/Sidebar/Sidebar.tsx
+index e727c3d..bc1c3db 100644
+--- a/app/components/Sidebar/Sidebar.tsx
++++ b/app/components/Sidebar/Sidebar.tsx
+@@ -265,13 +265,25 @@ function Sidebar({
+     ? 1
+     : Number(user?.getPreference(UserPreference.InterfaceZoom, 1)) || 1;
+ 
+-  const style = React.useMemo(
+-    (): React.CSSProperties =>
++  // Auto-hide (KMS patch 0012). A collapsed sidebar is moved off screen with a
++  // pixel offset on inset-inline-start instead of a percentage translateX: in
++  // Firefox the RTL percentage transform did not hide the sidebar background.
++  // The offset is a plain length on the (possibly zoomed) element, so it is
++  // divided by the zoom like the width. Hover and focus override it in CSS.
++  const peek = direction === "rtl" || Desktop.hasInsetTitlebar() ? 8 : 16;
++  const hiddenOffset =
++    collapsed && !isMobile ? -(width - peek) / uiZoom : undefined;
++
++  const style = React.useMemo((): React.CSSProperties => {
++    const base: React.CSSProperties =
+       uiZoom === 1
+         ? { width: `${width}px` }
+-        : { width: `${width / uiZoom}px`, zoom: uiZoom },
+-    [width, uiZoom]
+-  );
++        : { width: `${width / uiZoom}px`, zoom: uiZoom };
++    if (hiddenOffset !== undefined) {
++      base.insetInlineStart = `${hiddenOffset}px`;
++    }
++    return base;
++  }, [width, uiZoom, hiddenOffset]);
+ 
+   const handleCloseSidebar = () => {
+     ui.toggleMobileSidebar();
+@@ -358,6 +370,7 @@ type ContainerProps = {
+ 
+ const hoverStyles = (props: ContainerProps) => `
+   transform: none !important;
++  inset-inline-start: 0 !important;
+   box-shadow: ${
+     props.$collapsed
+       ? "rgba(0, 0, 0, 0.2) 1px 0 4px"
+@@ -426,16 +439,13 @@ const Container = styled(Flex)<ContainerProps>`
+     min-width: 0;
+     transition:
+       box-shadow 150ms ease-in-out,
+-      transform 150ms ease-out${(props: ContainerProps) =>
++      inset-inline-start 150ms ease-out${(props: ContainerProps) =>
+         props.$isAnimating ? `, width ${ANIMATION_MS}ms ease-out` : ""};
+-    transform: translateX(${(props: ContainerProps) =>
+-      props.$collapsed
+-        ? `calc(-100% + ${Desktop.hasInsetTitlebar() ? 8 : 16}px)`
+-        : 0});
++    /* the collapsed offset is set inline on inset-inline-start (patch 0012) */
++    transform: none;
+ 
+     [dir="rtl"] & {
+-      transform: translateX(${(props: ContainerProps) =>
+-        props.$collapsed ? `calc(100% - 8px)` : 0});
++      transform: none;
+     }
+ 
+     ${(props: ContainerProps) => props.$isHovering && hoverStyles(props)}
+diff --git a/app/components/Sidebar/components/DocumentLink.tsx b/app/components/Sidebar/components/DocumentLink.tsx
+index 4cf48b3..e9a4afa 100644
+--- a/app/components/Sidebar/components/DocumentLink.tsx
++++ b/app/components/Sidebar/components/DocumentLink.tsx
+@@ -335,7 +335,10 @@ const DocumentLink = observer(function DocumentLink({
+       onDisclosureClick={handleDisclosureClick}
+       onExpand={handleExpand}
+       onCollapse={handleCollapse}
+-      dragRef={drag}
++      // KMS patch 0018: while the title is being renamed the row must not be
++      // draggable, Firefox cannot place the caret or select text in an input
++      // inside a draggable element (Chrome can).
++      dragRef={isEditing ? undefined : drag}
+       isDragging={isDragging}
+       isMoving={isMoving}
+       parentRef={parentRef}

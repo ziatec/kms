@@ -1,0 +1,2609 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Thu, 15 Oct 2026 18:30:00 +0330
+Subject: [PATCH 20/20] feat(editor): multi-level numbering, Persian letters and Abjad, numbers styled like the text
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.2 (2026-10-16)  1.2: an item joined to a list after other content (e.g. as
+  5) and then moved to the next level with Tab was numbered 4.5 instead of 4.1: a later
+  segment used its stored start number (kept for Markdown) to start the new level. Only
+  the first segment of a list, and nested lists, use their own start number now.
+  1.1: content between two segments of the same list (the
+  text of an item, e.g. paragraphs after "الف)" before "ب)") is indented to where the
+  text of the last item before it starts, at that item's level.
+  1.0: first version.
+Root: build/outline-1.11.0 (apply after 0001..0019)
+
+Numbers are computed, not stored (in the editor):
+- Every numbered list (segment) may carry a list id; segments with the same
+  id are numbered as one list, in document order, also when other content
+  lies between them. Inserting, deleting or moving an item renumbers the
+  rest. Lists without an id behave as before (each starts at its start).
+- A segment has a level (0 = first); a list nested in an item is one level
+  deeper. Numbers per level restart under each item of the level above.
+- The number is drawn in the margin of the item's first line with the font,
+  size, weight, slant and color of the item's text (a heading in a list item
+  gives its number the heading's size and weight). The list marker is hidden.
+  HTML without the editor and Markdown keep normal list numbers; later
+  segments keep their start number in `order` for them.
+
+Menu "Numbering" (formatting toolbar, replaces "Number style"):
+- Number type of the level: default, 1 2 3 (Persian digits in RTL lists),
+  Persian alphabet الف ب پ, Abjad الف ب ج د, a b c, A B C. Set on one item, it
+  applies to every item of that level of the list.
+- Suffix . ) - for the whole list.
+- Full number 1.2.1 (on/off) for the whole list; mixed types give e.g. ۱.الف
+- Number color per level (or the color of the text): e.g. level 1 green,
+  level 2 red, for all items of the level.
+- Next level / Previous level (also Tab / Shift+Tab, Mod+] / Mod+[).
+- Select all items of this level; Join previous numbering; Restart
+  numbering (from 1).
+- A paragraph after a numbered list (also with other content between) shows
+  the menu with "Join previous numbering" only.
+
+Text of an item (1.1):
+- Blocks that lie between two segments of the same list belong to the last
+  item before them: they start where that item's text starts (its level).
+  Content after the last segment of a list is not indented.
+
+Levels:
+- Tab nests an item under the one before; the first item of a segment (e.g.
+  a paragraph just joined after other content) gets a segment of its own one
+  level deeper, so it becomes 2.1 and the next items of level 1 go on.
+- Shift+Tab moves back one level; on the first level the item leaves the
+  list as before. Neighbouring segments of the same list and level are
+  joined again.
+
+Selecting (with patch 0017):
+- A click on a number selects all items of its level in the list (their
+  first lines are picked parts, the last one the selection); Ctrl/Cmd+click
+  adds or removes one item. Tab / Shift+Tab, the menu, and formatting then
+  act on all picked items; the parts stay picked.
+- Numbering several parts picked with Ctrl gives them one list id.
+- Pasted lists get new ids (a pasted copy is numbered on its own).
+
+Files (9; N = new, M = modified, D = deleted):
+  M app/editor/menus/formatting.tsx
+  M shared/editor/components/Styles.ts
+  M shared/editor/extensions/MultiSelection.ts
+  N shared/editor/lib/listId.ts
+  N shared/editor/lib/listNumbering.test.ts
+  N shared/editor/lib/listNumbering.ts
+  M shared/editor/lib/multiSelection.ts
+  M shared/editor/nodes/OrderedList.ts
+  M shared/i18n/locales/fa_IR/translation.json
+
+---
+---
+
+diff --git a/app/editor/menus/formatting.tsx b/app/editor/menus/formatting.tsx
+index 13aeadc..5abc97a 100644
+--- a/app/editor/menus/formatting.tsx
++++ b/app/editor/menus/formatting.tsx
+@@ -58,8 +58,14 @@ import ListStyleIcon from "~/components/Icons/ListStyleIcon";
+ import {
+   findOrderedList,
+   getListDirection,
+-  isListStyleActive,
+ } from "@shared/editor/queries/getListDirection";
++import {
++  NUMBER_TYPES,
++  findPreviousSegment,
++  findSegmentAt,
++  formatNumber,
++  getNumberingAtSelection,
++} from "@shared/editor/lib/listNumbering";
+ import TextAlignIcon from "~/components/Icons/TextAlignIcon";
+ import TextStyleIcon from "~/components/Icons/TextStyleIcon";
+ import { getTextStyle } from "@shared/editor/queries/getTextStyle";
+@@ -124,10 +130,39 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+     { listStyle: "number-paren", suffix: ")" },
+     { listStyle: "number-dash", suffix: "-" },
+   ];
+-  const currentSuffix =
+-    numberStyles.find(
+-      (style) => style.listStyle === orderedList?.node.attrs.listStyle
+-    )?.suffix ?? ".";
++  // KMS patch 0020: multi-level numbering of the list around the cursor, or
++  // joining a paragraph to the numbered list before it.
++  const numbering = orderedList
++    ? getNumberingAtSelection(state, listDir)
++    : null;
++  const currentSuffix = numbering?.suffix ?? ".";
++  const listType = schema.nodes.ordered_list;
++  const segment = listType
++    ? findSegmentAt(state.doc, state.selection.from, listType)
++    : null;
++  const canJoinList =
++    !!listType &&
++    !isTableCell &&
++    !!findPreviousSegment(
++      state.doc,
++      segment ? segment.pos : state.selection.from,
++      listType
++    );
++  const numberTypeLabels: Record<(typeof NUMBER_TYPES)[number], string> = {
++    decimal: listDir === "rtl" ? "۱، ۲، ۳" : "1, 2, 3",
++    "alpha-fa": `${t("Persian alphabet")}: الف، ب، پ`,
++    abjad: `${t("Abjad")}: الف، ب، ج، د`,
++    "lower-alpha": "a, b, c",
++    "upper-alpha": "A, B, C",
++  };
++  const sampleNumber = numbering
++    ? formatNumber(1, numbering.type, numbering.dir)
++    : one;
++  const joinItem: MenuItem = {
++    name: "joinPreviousList",
++    label: t("Join previous numbering"),
++    visible: canJoinList,
++  };
+   const textAlignment = getTextAlignment(state);
+   const textStyle = getTextStyle(state);
+ 
+@@ -232,20 +267,101 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+       visible: !isInCodeBlock && !isTableCell,
+     },
+     {
+-      // Number style of the numbered list around the cursor: 1. / 1) / 1-,
+-      // shown with Persian digits when the list is right-to-left.
++      // Numbering of the list around the cursor (KMS patch 0020): kind of
++      // numbers, suffix 1. / 1) / 1-, full numbers 1.1, color of the numbers
++      // per level, levels, and joining to the numbered list before. Shown
++      // with Persian digits when the list is right-to-left.
+       group: MenuItemGroup.block,
+-      tooltip: t("Number style"),
+-      icon: <ListStyleIcon label={one + currentSuffix} dir={listDir} />,
+-      visible: !!orderedList && !isInCodeBlock,
+-      children: (): MenuItem[] =>
+-        numberStyles.map(({ listStyle, suffix }) => ({
+-          name: "setListStyle",
+-          label: one + suffix,
+-          icon: <ListStyleIcon label={one + suffix} dir={listDir} />,
+-          active: isListStyleActive(listStyle),
+-          attrs: { listStyle },
+-        })),
++      tooltip: t("Numbering"),
++      icon: (
++        <ListStyleIcon label={sampleNumber + currentSuffix} dir={listDir} />
++      ),
++      visible: (!!numbering || canJoinList) && !isInCodeBlock,
++      children: (): MenuItem[] => {
++        const n = numbering;
++        return !n
++          ? [joinItem]
++          : [
++              {
++                label: t("Number type"),
++                children: [
++                  {
++                    name: "setNumberType",
++                    label: t("Default"),
++                    active: () => !n.typeChosen,
++                    attrs: { type: "auto" },
++                  },
++                  ...NUMBER_TYPES.map((type) => ({
++                    name: "setNumberType",
++                    label: numberTypeLabels[type],
++                    active: () =>
++                      n.typeChosen && n.type === type,
++                    attrs: { type },
++                  })),
++                ],
++              },
++              ...numberStyles.map(({ listStyle, suffix }) => ({
++                name: "setListStyle",
++                label: sampleNumber + suffix,
++                icon: (
++                  <ListStyleIcon label={sampleNumber + suffix} dir={listDir} />
++                ),
++                active: () => n.suffix === suffix,
++                attrs: { listStyle },
++              })),
++              {
++                name: "toggleFullNumber",
++                label: `${t("Full number")} (${listDir === "rtl" ? "۱.۲.۱" : "1.2.1"})`,
++                active: () => n.full,
++              },
++              {
++                label: t("Number color"),
++                icon: (
++                  <CircleIcon
++                    retainColor
++                    color={n.color ?? "currentColor"}
++                  />
++                ),
++                children: [
++                  {
++                    name: "setNumberColor",
++                    label: t("Same as text"),
++                    icon: <DottedCircleIcon retainColor color="transparent" />,
++                    active: () => !n.color,
++                    attrs: { color: null },
++                  },
++                  ...textColors.map((color) => ({
++                    name: "setNumberColor",
++                    label: t(color.name),
++                    icon: <CircleIcon retainColor color={color.hex} />,
++                    active: () => n.color === color.hex,
++                    attrs: { color: color.hex },
++                  })),
++                ],
++              },
++              { name: "separator" },
++              {
++                name: "listLevelDown",
++                label: `${t("Next level")} (Tab)`,
++                icon: <IndentIcon />,
++              },
++              {
++                name: "listLevelUp",
++                label: `${t("Previous level")} (⇧+Tab)`,
++                icon: <OutdentIcon />,
++              },
++              {
++                name: "selectListLevel",
++                label: t("Select all items of this level"),
++              },
++              { name: "separator" },
++              joinItem,
++              {
++                name: "restartNumbering",
++                label: t("Restart numbering"),
++              },
++            ];
++      },
+     },
+     {
+       name: "outdentList",
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index 24ea6b6..7168327 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -1598,6 +1598,42 @@ ol > li[data-marker-style]::marker {
+   font-size: var(--marker-size);
+ }
+ 
++/* KMS patch 0020: in the editor the numbers are computed (multi-level, one
++   list across segments, letters and Abjad) and drawn by the OrderedList
++   plugin in the margin of each item, with the font, size, weight and color
++   of the item's text (or the color chosen for the level). The list marker is
++   hidden then; HTML without the editor keeps the markers above. */
++ol > li.kms-numbered {
++  list-style: none;
++
++  &::marker {
++    content: none;
++  }
++}
++
++.kms-list-num {
++  position: absolute;
++  padding: 0 0.4em;
++  white-space: nowrap;
++  unicode-bidi: isolate;
++  font-variant-numeric: tabular-nums;
++  text-decoration: none;
++  cursor: var(--pointer);
++  user-select: none;
++  border-radius: 4px;
++  transition: background 100ms ease;
++
++  &:hover {
++    background: ${props.theme.listItemHoverBackground};
++  }
++}
++
++@media print {
++  .kms-list-num:hover {
++    background: none;
++  }
++}
++
+ ol ol {
+   list-style: lower-alpha;
+ }
+diff --git a/shared/editor/extensions/MultiSelection.ts b/shared/editor/extensions/MultiSelection.ts
+index f7faf8b..b8f7bc1 100644
+--- a/shared/editor/extensions/MultiSelection.ts
++++ b/shared/editor/extensions/MultiSelection.ts
+@@ -1,4 +1,4 @@
+-// VERSION: 1.5 (2026-10-15) patch 0017-multi-selection
++// VERSION: 1.6 (2026-10-15) patch 0017-multi-selection, 0020-list-numbering-levels
+ import type { Command } from "prosemirror-state";
+ import { Plugin, TextSelection } from "prosemirror-state";
+ import type { EditorView } from "prosemirror-view";
+@@ -6,6 +6,7 @@ import { Decoration, DecorationSet } from "prosemirror-view";
+ import { isMac } from "../../utils/browser";
+ import { isModKey } from "../../utils/keyboard";
+ import Extension from "../lib/Extension";
++import { changeListLevel } from "../lib/listNumbering";
+ import type {
+   MultiSelectionMeta,
+   MultiSelectionState,
+@@ -342,6 +343,21 @@ export default class MultiSelection extends Extension {
+               setRanges(view, { ranges: [], gesture: false });
+               return true;
+             }
++            // KMS patch 0020: Tab / Shift+Tab move all picked numbered items
++            // to the next / previous level and keep them picked.
++            if (
++              event.key === "Tab" &&
++              !event.ctrlKey &&
++              !event.metaKey &&
++              !event.altKey &&
++              changeListLevel(event.shiftKey ? -1 : 1)(
++                view.state,
++                view.dispatch
++              )
++            ) {
++              event.preventDefault();
++              return true;
++            }
+             if (MOVE_KEYS.has(event.key)) {
+               setRanges(view, { gesture: false });
+             }
+diff --git a/shared/editor/lib/listId.ts b/shared/editor/lib/listId.ts
+new file mode 100644
+index 0000000..bc309f8
+--- /dev/null
++++ b/shared/editor/lib/listId.ts
+@@ -0,0 +1,16 @@
++// VERSION: 1.0 (2026-10-15) patch 0020-list-numbering-levels
++
++/**
++ * Returns a new id for a numbered list. Lists (segments) that share an id are
++ * numbered as one list, also when other content lies between them.
++ *
++ * @returns the id.
++ */
++export function newListId(): string {
++  const cryptoApi = (globalThis as { crypto?: { randomUUID?: () => string } })
++    .crypto;
++  if (cryptoApi?.randomUUID) {
++    return cryptoApi.randomUUID();
++  }
++  return `l${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
++}
+diff --git a/shared/editor/lib/listNumbering.test.ts b/shared/editor/lib/listNumbering.test.ts
+new file mode 100644
+index 0000000..541360f
+--- /dev/null
++++ b/shared/editor/lib/listNumbering.test.ts
+@@ -0,0 +1,185 @@
++// VERSION: 1.2 (2026-10-16) patch 0020-list-numbering-levels
++import type { Node } from "prosemirror-model";
++import type { Command } from "prosemirror-state";
++import { EditorState, TextSelection } from "prosemirror-state";
++import { doc, p, schema } from "@shared/test/editor";
++import {
++  changeListLevel,
++  computeNumbering,
++  formatNumber,
++  joinPreviousList,
++  restartNumbering,
++  setNumberSuffix,
++  setNumberType,
++  syncSegmentStarts,
++  toggleFullNumber,
++} from "./listNumbering";
++
++const { ordered_list, list_item } = schema.nodes;
++
++/** A numbered list item with a paragraph and optional nested lists. */
++function li(text: string, ...children: Node[]) {
++  return list_item.create(null, [p(text), ...children]);
++}
++
++/** A numbered list. */
++function ol(attrs: Record<string, unknown>, ...items: Node[]) {
++  return ordered_list.create(attrs, items);
++}
++
++/** The numbers of all items, in document order. */
++function labels(node: Node, dir: "rtl" | "ltr" = "ltr") {
++  return computeNumbering(node, dir)
++    .items.map((item) => item.label)
++    .join(" ");
++}
++
++/** A state with the cursor in the first text node with the given text. */
++function stateAt(node: Node, text: string) {
++  let pos = -1;
++  node.descendants((child, childPos) => {
++    if (pos === -1 && child.isText && child.text === text) {
++      pos = childPos;
++    }
++    return pos === -1;
++  });
++  const state = EditorState.create({ doc: node });
++  return state.apply(
++    state.tr.setSelection(TextSelection.create(state.doc, pos))
++  );
++}
++
++/** Runs a command and returns the new state. */
++function run(state: EditorState, command: Command) {
++  let next = state;
++  command(state, (tr) => {
++    next = state.apply(tr);
++  });
++  return next;
++}
++
++describe("formatNumber", () => {
++  it("writes Persian letters in alphabet and Abjad order", () => {
++    expect([1, 2, 3, 32].map((n) => formatNumber(n, "alpha-fa", "rtl"))).toEqual(
++      ["الف", "ب", "پ", "ی"]
++    );
++    expect([1, 3, 5, 28].map((n) => formatNumber(n, "abjad", "rtl"))).toEqual([
++      "الف",
++      "ج",
++      "هـ",
++      "غ",
++    ]);
++  });
++
++  it("writes Persian digits in right-to-left lists", () => {
++    expect(formatNumber(12, "decimal", "rtl")).toBe("۱۲");
++    expect(formatNumber(12, "decimal", "ltr")).toBe("12");
++  });
++});
++
++describe("computeNumbering", () => {
++  it("numbers nested lists", () => {
++    const node = doc([
++      ol({}, li("a"), li("b", ol({}, li("b1"), li("b2"))), li("c")),
++    ]);
++    expect(labels(node)).toBe("1. 2. a. b. 3.");
++  });
++
++  it("numbers segments with one list id as one list", () => {
++    const node = doc([
++      ol({ listId: "L" }, li("a"), li("b")),
++      p("x"),
++      ol({ listId: "L" }, li("c")),
++      ol({}, li("d")),
++    ]);
++    expect(labels(node)).toBe("1. 2. 3. 1.");
++  });
++
++  it("shows full numbers with the type of each level", () => {
++    const node = doc([
++      ol(
++        {
++          listId: "L",
++          numbering: { full: true, suffix: ")", levels: [{}, { type: "alpha-fa" }] },
++        },
++        li("آ", ol({}, li("آ۱"), li("آ۲"))),
++        li("ب")
++      ),
++      p("x"),
++      ol({ listId: "L", level: 1 }, li("ب۱")),
++    ]);
++    expect(labels(node)).toBe("۱) ۱.الف) ۱.ب) ۲) ۲.الف)");
++  });
++});
++
++describe("changeListLevel", () => {
++  it("nests an item under the one before", () => {
++    const state = stateAt(doc([ol({}, li("a"), li("b"), li("c"))]), "b");
++    expect(labels(run(state, changeListLevel(1)).doc)).toBe("1. a. 2.");
++  });
++
++  it("gives the first item a segment one level deeper, and back", () => {
++    const state = stateAt(doc([ol({}, li("a"), li("b"))]), "a");
++    const deeper = run(state, changeListLevel(1));
++    expect(deeper.doc.childCount).toBe(2);
++    expect(deeper.doc.child(0).attrs.level).toBe(1);
++    expect(deeper.doc.child(0).attrs.listId).toBe(
++      deeper.doc.child(1).attrs.listId
++    );
++    const back = run(deeper, changeListLevel(-1));
++    expect(back.doc.childCount).toBe(1);
++    expect(labels(back.doc)).toBe("1. 2.");
++  });
++});
++
++describe("later segments", () => {
++  it("start a deeper level at 1, not at their stored start", () => {
++    const node = doc([
++      ol({ listId: "L" }, li("a"), li("b")),
++      p("x"),
++      ol({ listId: "L", level: 1, order: 3 }, li("b1"), li("b2")),
++    ]);
++    expect(labels(node)).toBe("1. 2. a. b.");
++  });
++});
++
++describe("joinPreviousList", () => {
++  it("joins a paragraph after other content and numbers on", () => {
++    const state = stateAt(
++      doc([ol({}, li("a"), li("b")), p("x"), p("y"), ol({}, li("z"))]),
++      "y"
++    );
++    const joined = run(state, joinPreviousList());
++    expect(labels(joined.doc)).toBe("1. 2. 3. 1.");
++    const deeper = run(joined, changeListLevel(1));
++    expect(labels(deeper.doc)).toBe("1. 2. a. 1.");
++    const full = run(run(deeper, toggleFullNumber()), setNumberType("alpha-fa"));
++    expect(labels(full.doc)).toBe("1. 2. 2.الف. 1.");
++    expect(labels(run(full, setNumberSuffix("-")).doc)).toBe(
++      "1- 2- 2.الف- 1."
++    );
++  });
++
++  it("joins a whole list and restarts it again", () => {
++    const state = stateAt(
++      doc([ol({}, li("a")), p("x"), ol({}, li("b"), li("c"))]),
++      "c"
++    );
++    const joined = run(state, joinPreviousList());
++    expect(labels(joined.doc)).toBe("1. 2. 3.");
++    expect(labels(run(joined, restartNumbering()).doc)).toBe("1. 1. 2.");
++  });
++});
++
++describe("syncSegmentStarts", () => {
++  it("writes the start number of later segments", () => {
++    const state = EditorState.create({
++      doc: doc([
++        ol({ listId: "L" }, li("a"), li("b")),
++        p("x"),
++        ol({ listId: "L" }, li("c")),
++      ]),
++    });
++    expect(syncSegmentStarts(state)?.doc.child(2).attrs.order).toBe(3);
++  });
++});
+diff --git a/shared/editor/lib/listNumbering.ts b/shared/editor/lib/listNumbering.ts
+new file mode 100644
+index 0000000..1269209
+--- /dev/null
++++ b/shared/editor/lib/listNumbering.ts
+@@ -0,0 +1,1355 @@
++// VERSION: 1.2 (2026-10-16) patch 0020-list-numbering-levels
++import type { Node as ProsemirrorNode, NodeType } from "prosemirror-model";
++import type { Command, EditorState, Transaction } from "prosemirror-state";
++import { EditorState as State, TextSelection } from "prosemirror-state";
++import {
++  liftListItem,
++  sinkListItem,
++  wrapInList,
++} from "prosemirror-schema-list";
++import { canJoin } from "prosemirror-transform";
++import { getListDirection } from "../queries/getListDirection";
++import { newListId } from "./listId";
++import type { MultiSelectionMeta, SelectedRange } from "./multiSelection";
++import {
++  getExtraRanges,
++  multiSelectionKey,
++  normalizeRanges,
++} from "./multiSelection";
++
++/*
++ * Multi-level numbering of numbered lists (KMS patch 0020).
++ *
++ * The numbers are never stored: they are computed from the document. Every
++ * top-level numbered list (a "segment") may carry a list id; segments with
++ * the same id are numbered as one list, in document order, also when other
++ * content lies between them. A segment has a level (0 = first level), and a
++ * list nested in an item is one level deeper than the item. The look of each
++ * level (number type and color), the suffix (. ) -) and whether the full
++ * number (1.2.1) is shown are kept in the `numbering` attribute of the
++ * segments of a list.
++ */
++
++/** The kinds of numbers. "auto" is the default of the level. */
++export type NumberType =
++  | "auto"
++  | "decimal"
++  | "alpha-fa"
++  | "abjad"
++  | "lower-alpha"
++  | "upper-alpha"
++  | "lower-roman";
++
++/** The number types offered in the menu. */
++export const NUMBER_TYPES: Exclude<NumberType, "auto" | "lower-roman">[] = [
++  "decimal",
++  "alpha-fa",
++  "abjad",
++  "lower-alpha",
++  "upper-alpha",
++];
++
++/** The suffixes after a number. */
++export type NumberSuffix = "." | ")" | "-";
++
++/** The look of one level of a list. */
++export type LevelConfig = {
++  /** The kind of numbers, the level's default when absent. */
++  type?: NumberType;
++  /** The color of the numbers, the color of the text when absent. */
++  color?: string | null;
++};
++
++/** The numbering of a list, kept on its segments. */
++export type NumberingConfig = {
++  /** The suffix after the number, from the list style when absent. */
++  suffix?: NumberSuffix;
++  /** Whether the numbers of the levels above are shown too: 1.2.1 */
++  full?: boolean;
++  /** The look of each level, from the first level on. */
++  levels?: LevelConfig[];
++};
++
++/** The list node types. */
++const LIST_NAMES = new Set(["ordered_list", "bullet_list", "checkbox_list"]);
++
++/** The deepest level kept in the configuration. */
++const MAX_LEVELS = 9;
++
++/** The suffix of each list style. */
++const STYLE_SUFFIX: Record<string, NumberSuffix> = {
++  number: ".",
++  "number-paren": ")",
++  "number-dash": "-",
++  "lower-alpha": ".",
++  "upper-alpha": ".",
++};
++
++/** The list style written for each suffix (also used by Markdown). */
++export const SUFFIX_STYLE: Record<NumberSuffix, string> = {
++  ".": "number",
++  ")": "number-paren",
++  "-": "number-dash",
++};
++
++/** The Persian alphabet, in the order of the alphabet. */
++const PERSIAN_ALPHABET = [
++  "الف",
++  "ب",
++  "پ",
++  "ت",
++  "ث",
++  "ج",
++  "چ",
++  "ح",
++  "خ",
++  "د",
++  "ذ",
++  "ر",
++  "ز",
++  "ژ",
++  "س",
++  "ش",
++  "ص",
++  "ض",
++  "ط",
++  "ظ",
++  "ع",
++  "غ",
++  "ف",
++  "ق",
++  "ک",
++  "گ",
++  "ل",
++  "م",
++  "ن",
++  "و",
++  "هـ",
++  "ی",
++];
++
++/** The letters in Abjad order (ابجد هوز حطی کلمن سعفص قرشت ثخذ ضظغ). */
++const ABJAD = [
++  "الف",
++  "ب",
++  "ج",
++  "د",
++  "هـ",
++  "و",
++  "ز",
++  "ح",
++  "ط",
++  "ی",
++  "ک",
++  "ل",
++  "م",
++  "ن",
++  "س",
++  "ع",
++  "ف",
++  "ص",
++  "ق",
++  "ر",
++  "ش",
++  "ت",
++  "ث",
++  "خ",
++  "ذ",
++  "ض",
++  "ظ",
++  "غ",
++];
++
++const LATIN = "abcdefghijklmnopqrstuvwxyz".split("");
++const PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
++
++/**
++ * Writes a number with letters: 1 → the first letter, after the last letter
++ * two letters follow (bijective, like aa, ab).
++ *
++ * @param n the number, 1 or more.
++ * @param letters the letters.
++ * @param join the text between two letters.
++ * @returns the letters.
++ */
++function toLetters(n: number, letters: string[], join = ""): string {
++  const parts: string[] = [];
++  let rest = n;
++  while (rest > 0) {
++    const index = (rest - 1) % letters.length;
++    parts.unshift(letters[index]);
++    rest = Math.floor((rest - 1) / letters.length);
++  }
++  return parts.join(join);
++}
++
++/**
++ * Writes a number with Roman numerals.
++ *
++ * @param n the number, 1 to 3999.
++ * @returns the numerals, in capitals.
++ */
++function toRoman(n: number): string {
++  const table: [number, string][] = [
++    [1000, "M"],
++    [900, "CM"],
++    [500, "D"],
++    [400, "CD"],
++    [100, "C"],
++    [90, "XC"],
++    [50, "L"],
++    [40, "XL"],
++    [10, "X"],
++    [9, "IX"],
++    [5, "V"],
++    [4, "IV"],
++    [1, "I"],
++  ];
++  let rest = n;
++  let result = "";
++  for (const [value, numeral] of table) {
++    while (rest >= value) {
++      result += numeral;
++      rest -= value;
++    }
++  }
++  return result;
++}
++
++/**
++ * Writes one number of a list.
++ *
++ * @param n the number.
++ * @param type the kind of number (not "auto").
++ * @param dir the direction of the list: Persian digits when right to left.
++ * @returns the number as text.
++ */
++export function formatNumber(
++  n: number,
++  type: NumberType,
++  dir: "rtl" | "ltr"
++): string {
++  if (n < 1 || !Number.isFinite(n) || type === "decimal" || type === "auto") {
++    const text = String(n);
++    return dir === "rtl"
++      ? text.replace(/[0-9]/g, (d) => PERSIAN_DIGITS[Number(d)])
++      : text;
++  }
++  switch (type) {
++    case "alpha-fa":
++      return toLetters(n, PERSIAN_ALPHABET, "‌");
++    case "abjad":
++      return toLetters(n, ABJAD, "‌");
++    case "lower-alpha":
++      return toLetters(n, LATIN);
++    case "upper-alpha":
++      return toLetters(n, LATIN).toUpperCase();
++    case "lower-roman":
++      return n < 4000 ? toRoman(n).toLowerCase() : String(n);
++    default:
++      return String(n);
++  }
++}
++
++/**
++ * Returns the kind of numbers of a level when none is chosen: numbers in a
++ * right-to-left list, and 1 / a / i in a left-to-right one (as before).
++ *
++ * @param type the chosen kind, if any.
++ * @param level the level, 0 for the first.
++ * @param dir the direction of the list.
++ * @returns the kind of numbers.
++ */
++export function resolveNumberType(
++  type: NumberType | undefined,
++  level: number,
++  dir: "rtl" | "ltr"
++): Exclude<NumberType, "auto"> {
++  if (type && type !== "auto") {
++    return type;
++  }
++  if (dir === "rtl") {
++    return "decimal";
++  }
++  return (["decimal", "lower-alpha", "lower-roman"] as const)[level % 3];
++}
++
++/** Matches the colors that can be given to numbers. */
++const COLOR = /^#[0-9a-f]{6}$/i;
++
++/**
++ * Keeps only valid values of a numbering configuration (it may come from a
++ * pasted document).
++ *
++ * @param value the stored value.
++ * @returns the configuration, or null when there is none.
++ */
++export function toNumberingConfig(value: unknown): NumberingConfig | null {
++  if (!value || typeof value !== "object") {
++    return null;
++  }
++  const input = value as Record<string, unknown>;
++  const config: NumberingConfig = {};
++  if (input.suffix === "." || input.suffix === ")" || input.suffix === "-") {
++    config.suffix = input.suffix;
++  }
++  if (input.full === true) {
++    config.full = true;
++  }
++  if (Array.isArray(input.levels)) {
++    config.levels = input.levels.slice(0, MAX_LEVELS).map((level) => {
++      const out: LevelConfig = {};
++      if (level && typeof level === "object") {
++        const { type, color } = level as Record<string, unknown>;
++        if (
++          typeof type === "string" &&
++          ([...NUMBER_TYPES, "lower-roman"] as string[]).includes(type)
++        ) {
++          out.type = type as NumberType;
++        }
++        if (typeof color === "string" && COLOR.test(color)) {
++          out.color = color;
++        }
++      }
++      return out;
++    });
++  }
++  return Object.keys(config).length ? config : null;
++}
++
++/**
++ * Parses a numbering configuration written in a data attribute.
++ *
++ * @param text the JSON text.
++ * @returns the configuration, or null.
++ */
++export function parseNumberingConfig(text: string | null): NumberingConfig | null {
++  if (!text) {
++    return null;
++  }
++  try {
++    return toNumberingConfig(JSON.parse(text));
++  } catch (_err) {
++    return null;
++  }
++}
++
++/** A numbered list item with its computed number. */
++export type NumberedItem = {
++  /** The position of the list item. */
++  pos: number;
++  /** The position of the numbered list that holds it. */
++  listPos: number;
++  /** The list it is numbered in. */
++  key: string;
++  /** The level, 0 for the first. */
++  level: number;
++  /** The number with its suffix, e.g. "۱.۲)". */
++  label: string;
++  /** The direction of the list. */
++  dir: "rtl" | "ltr";
++  /** The color chosen for the numbers of the level, if any. */
++  color: string | null;
++};
++
++/** A numbered list node with the list it is numbered in. */
++export type NumberedList = {
++  pos: number;
++  key: string;
++  /** The level of its items. */
++  level: number;
++  /** Whether it is a segment (not nested in a numbered item). */
++  topLevel: boolean;
++  /** The longest number of its items, in characters. */
++  longest: number;
++};
++
++/** The numbering of a document. */
++export type Numbering = {
++  items: NumberedItem[];
++  lists: NumberedList[];
++  /** The configuration of each list, from its first segment. */
++  configs: Map<string, NumberingConfig | null>;
++};
++
++type Context = { key: string; level: number; dir: "rtl" | "ltr" } | null;
++
++/**
++ * Computes the number of every item of every numbered list.
++ *
++ * @param doc the document.
++ * @param fallbackDir the direction of a list that has no text yet.
++ * @returns the numbering.
++ */
++export function computeNumbering(
++  doc: ProsemirrorNode,
++  fallbackDir: "rtl" | "ltr" = "ltr"
++): Numbering {
++  const items: NumberedItem[] = [];
++  const lists: NumberedList[] = [];
++  const configs = new Map<string, NumberingConfig | null>();
++  const counters = new Map<string, { counts: number[]; types: NumberType[] }>();
++
++  const visitList = (list: ProsemirrorNode, pos: number, ctx: Context) => {
++    const key = ctx
++      ? ctx.key
++      : (typeof list.attrs.listId === "string" && list.attrs.listId) ||
++        `@${pos}`;
++    const level = ctx ? ctx.level + 1 : clampLevel(list.attrs.level);
++    if (!ctx && !configs.has(key)) {
++      configs.set(key, toNumberingConfig(list.attrs.numbering));
++    }
++    const config = configs.get(key) ?? null;
++    const dir = getListDirection(list) ?? ctx?.dir ?? fallbackDir;
++    // Only the first segment of a list (and a nested list) has its own start
++    // number. A later segment keeps the start written for Markdown in
++    // `order`, which must not restart a level: after Tab it is a stale
++    // number (1.2: an item joined as 5 and moved to the next level showed 4.5
++    // instead of 4.1).
++    const ownStart = !!ctx || !counters.has(key);
++    const state = counters.get(key) ?? { counts: [], types: [] };
++    counters.set(key, state);
++    const record: NumberedList = {
++      pos,
++      key,
++      level,
++      topLevel: !ctx,
++      longest: 0,
++    };
++    lists.push(record);
++
++    const levelConfig = config?.levels?.[level];
++    const legacyType =
++      list.attrs.listStyle === "lower-alpha" ||
++      list.attrs.listStyle === "upper-alpha"
++        ? (list.attrs.listStyle as NumberType)
++        : undefined;
++    const type = resolveNumberType(levelConfig?.type ?? legacyType, level, dir);
++    const suffix =
++      config?.suffix ?? STYLE_SUFFIX[String(list.attrs.listStyle)] ?? ".";
++    const start = ownStart ? Number(list.attrs.order) : 1;
++
++    list.forEach((item, offset) => {
++      const itemPos = pos + 1 + offset;
++      const { counts, types } = state;
++      if (counts.length > level + 1) {
++        counts.length = level + 1;
++      }
++      while (counts.length < level) {
++        counts.push(1);
++      }
++      if (counts.length === level) {
++        counts.push(Number.isFinite(start) && start >= 0 ? start : 1);
++      } else {
++        counts[level] += 1;
++      }
++      types.length = Math.min(types.length, level + 1);
++      types[level] = type;
++
++      const label =
++        (config?.full
++          ? counts
++              .map((count, i) =>
++                formatNumber(
++                  count,
++                  types[i] ??
++                    resolveNumberType(config.levels?.[i]?.type, i, dir),
++                  dir
++                )
++              )
++              .join(".")
++          : formatNumber(counts[level], type, dir)) + suffix;
++      record.longest = Math.max(record.longest, label.length);
++      items.push({
++        pos: itemPos,
++        listPos: pos,
++        key,
++        level,
++        label,
++        dir,
++        color: levelConfig?.color ?? null,
++      });
++      walk(item, itemPos + 1, { key, level, dir });
++    });
++  };
++
++  const walk = (parent: ProsemirrorNode, start: number, ctx: Context) => {
++    parent.forEach((child, offset) => {
++      const pos = start + offset;
++      if (child.type.name === "ordered_list") {
++        visitList(child, pos, ctx);
++      } else if (!child.isTextblock && !child.isLeaf) {
++        walk(child, pos + 1, ctx);
++      }
++    });
++  };
++
++  walk(doc, 0, null);
++  return { items, lists, configs };
++}
++
++/**
++ * Reads a level attribute.
++ *
++ * @param value the stored value.
++ * @returns a level from 0 to MAX_LEVELS - 1.
++ */
++function clampLevel(value: unknown): number {
++  const level = Number(value);
++  return Number.isInteger(level)
++    ? Math.min(Math.max(level, 0), MAX_LEVELS - 1)
++    : 0;
++}
++
++/**
++ * The parts to act on: the picked parts (Ctrl) and the selection.
++ *
++ * @param state the editor state.
++ * @returns the parts, in document order; the selection may be empty.
++ */
++function targetRanges(state: EditorState): SelectedRange[] {
++  const { from, to } = state.selection;
++  const ranges = [...getExtraRanges(state), { from, to }];
++  return ranges.sort((a, b) => a.from - b.from);
++}
++
++/**
++ * Returns the numbered list items the parts touch: the innermost numbered item
++ * around the start of each part, and every numbered item whose first block
++ * the part overlaps.
++ *
++ * @param doc the document.
++ * @param ranges the parts.
++ * @param listType the numbered list type.
++ * @returns the positions of the items, in document order, without repeats.
++ */
++export function findNumberedItems(
++  doc: ProsemirrorNode,
++  ranges: SelectedRange[],
++  listType: NodeType
++): number[] {
++  const found = new Set<number>();
++  for (const range of ranges) {
++    // The innermost list item around the start; it counts only when it is a
++    // numbered one (a bulleted item inside a numbered one is left alone).
++    const $from = doc.resolve(range.from);
++    for (let depth = $from.depth; depth > 0; depth--) {
++      const parent = $from.node(depth - 1);
++      if (LIST_NAMES.has(parent.type.name)) {
++        if (parent.type === listType) {
++          found.add($from.before(depth));
++        }
++        break;
++      }
++    }
++    if (range.to > range.from) {
++      doc.nodesBetween(range.from, range.to, (node, pos, parent) => {
++        if (parent?.type === listType && node.firstChild) {
++          const blockEnd = pos + 1 + node.firstChild.nodeSize;
++          if (range.from < blockEnd && range.to > pos + 1) {
++            found.add(pos);
++          }
++        }
++        return true;
++      });
++    }
++  }
++  return [...found].sort((a, b) => a - b);
++}
++
++/**
++ * Drops items that lie inside another of the items (they move with it).
++ *
++ * @param doc the document.
++ * @param positions the item positions, in document order.
++ * @returns the outermost items.
++ */
++function outermost(doc: ProsemirrorNode, positions: number[]): number[] {
++  const result: number[] = [];
++  for (const pos of positions) {
++    const last = result[result.length - 1];
++    const lastNode = last !== undefined ? doc.nodeAt(last) : null;
++    if (lastNode && pos < last + lastNode.nodeSize) {
++      continue;
++    }
++    result.push(pos);
++  }
++  return result;
++}
++
++/**
++ * Whether a numbered list is nested in a numbered list item.
++ *
++ * @param doc the document.
++ * @param listPos the position of the list.
++ * @param listType the numbered list type.
++ * @returns true when nested.
++ */
++function isNestedList(
++  doc: ProsemirrorNode,
++  listPos: number,
++  listType: NodeType
++): boolean {
++  const $pos = doc.resolve(listPos);
++  for (let depth = $pos.depth; depth > 0; depth--) {
++    if ($pos.node(depth - 1).type === listType) {
++      return true;
++    }
++  }
++  return false;
++}
++
++/**
++ * Runs a command with the cursor (or range) at the given place and adds its
++ * steps to a transaction.
++ *
++ * @param tr the transaction.
++ * @param command the command.
++ * @param from where the selection starts.
++ * @param to where it ends, `from` when absent.
++ * @returns whether anything changed.
++ */
++function runAt(
++  tr: Transaction,
++  command: Command,
++  from: number,
++  to = from
++): boolean {
++  const doc = tr.doc;
++  const selection =
++    to > from
++      ? TextSelection.between(doc.resolve(from), doc.resolve(to))
++      : TextSelection.near(doc.resolve(from));
++  let changed = false;
++  command(State.create({ doc, selection }), (t) => {
++    t.steps.forEach((step) => {
++      if (!tr.maybeStep(step).failed) {
++        changed = true;
++      }
++    });
++  });
++  return changed;
++}
++
++/**
++ * Gives a segment a list id when it has none, so that the parts of it that a
++ * change splits off stay numbered with it.
++ *
++ * @param tr the transaction.
++ * @param listPos the position of the segment.
++ * @returns the list id.
++ */
++function ensureListId(tr: Transaction, listPos: number): string {
++  const list = tr.doc.nodeAt(listPos);
++  if (!list) {
++    return newListId();
++  }
++  if (typeof list.attrs.listId === "string" && list.attrs.listId) {
++    return list.attrs.listId;
++  }
++  const listId = newListId();
++  tr.setNodeMarkup(listPos, undefined, { ...list.attrs, listId });
++  return listId;
++}
++
++/**
++ * Splits a segment so that an item is alone in its own segment, with the
++ * same attributes.
++ *
++ * @param tr the transaction.
++ * @param itemPos the position of the item.
++ * @returns the position of the segment that holds only the item.
++ */
++function isolateItem(tr: Transaction, itemPos: number): number {
++  const $item = tr.doc.resolve(itemPos);
++  const listPos = $item.before();
++  ensureListId(tr, listPos);
++  const list = tr.doc.nodeAt(listPos);
++  if (!list) {
++    return listPos;
++  }
++  const index = $item.index();
++  const item = list.child(index);
++  const typesAfter = [{ type: list.type, attrs: list.attrs }];
++  if (index < list.childCount - 1) {
++    tr.split(itemPos + item.nodeSize, 1, typesAfter);
++  }
++  if (index > 0) {
++    tr.split(itemPos, 1, typesAfter);
++    return itemPos + 1;
++  }
++  return listPos;
++}
++
++/**
++ * Joins neighbouring segments of the same list and level.
++ *
++ * @param tr the transaction.
++ * @param listType the numbered list type.
++ */
++export function joinSegments(tr: Transaction, listType: NodeType) {
++  let joined = true;
++  while (joined) {
++    joined = false;
++    tr.doc.descendants((node, pos) => {
++      if (joined) {
++        return false;
++      }
++      if (node.type !== listType) {
++        return true;
++      }
++      const end = pos + node.nodeSize;
++      const next = tr.doc.resolve(end).nodeAfter;
++      if (
++        next?.type === listType &&
++        node.attrs.listId &&
++        next.attrs.listId === node.attrs.listId &&
++        clampLevel(next.attrs.level) === clampLevel(node.attrs.level) &&
++        canJoin(tr.doc, end)
++      ) {
++        tr.join(end);
++        joined = true;
++        return false;
++      }
++      return true;
++    });
++  }
++}
++
++/**
++ * Keeps the selection and the picked parts on the same text after a change.
++ *
++ * @param state the state before the change.
++ * @param tr the change.
++ */
++function keepSelection(state: EditorState, tr: Transaction) {
++  tr.setSelection(state.selection.map(tr.doc, tr.mapping));
++  const extras = getExtraRanges(state);
++  if (extras.length) {
++    tr.setMeta(multiSelectionKey, {
++      ranges: normalizeRanges(
++        extras.map((r) => ({
++          from: tr.mapping.map(r.from, 1),
++          to: tr.mapping.map(r.to, -1),
++        }))
++      ),
++      gesture: false,
++    } satisfies MultiSelectionMeta);
++  }
++}
++
++/**
++ * Moves the selected numbered items (and the picked ones) one level deeper
++ * or one level up. An item that cannot be nested under the item before it
++ * (the first of a segment) gets a segment of its own one level deeper, so a
++ * paragraph joined to a list after other content can still be 2.1. A whole
++ * segment moves as one.
++ *
++ * @param delta 1 for the next level, -1 for the level before.
++ * @returns the command.
++ */
++export function changeListLevel(delta: number): Command {
++  return (state, dispatch) => {
++    const listType = state.schema.nodes.ordered_list;
++    const itemType = state.schema.nodes.list_item;
++    if (!listType || !itemType) {
++      return false;
++    }
++    const items = outermost(
++      state.doc,
++      findNumberedItems(state.doc, targetRanges(state), listType)
++    );
++    if (!items.length) {
++      return false;
++    }
++
++    const tr = state.tr;
++
++    // Items that are all the items of a segment: the segment moves.
++    const groups = new Map<number, number[]>();
++    for (const pos of items) {
++      const listPos = state.doc.resolve(pos).before();
++      groups.set(listPos, [...(groups.get(listPos) ?? []), pos]);
++    }
++    const single: number[] = [];
++    const lift: number[] = [];
++    for (const [listPos, members] of groups) {
++      const list = state.doc.nodeAt(listPos);
++      if (
++        list &&
++        members.length === list.childCount &&
++        !isNestedList(state.doc, listPos, listType)
++      ) {
++        const level = clampLevel(list.attrs.level);
++        const next = level + delta;
++        if (next >= 0 && next < MAX_LEVELS) {
++          tr.setNodeMarkup(listPos, undefined, { ...list.attrs, level: next });
++          continue;
++        }
++        if (next < 0) {
++          lift.push(...members);
++          continue;
++        }
++      }
++      single.push(...members);
++    }
++
++    const order = delta > 0 ? single : [...single].reverse();
++    for (const original of order) {
++      const pos = tr.mapping.map(original, 1);
++      const $pos = tr.doc.resolve(pos);
++      const list = $pos.parent;
++      const listPos = $pos.before();
++      const item = tr.doc.nodeAt(pos);
++      if (!item || list.type !== listType) {
++        continue;
++      }
++      const nested = isNestedList(tr.doc, listPos, listType);
++      const inside = pos + 1;
++      if (delta > 0) {
++        if ($pos.index() > 0) {
++          runAt(tr, sinkListItem(itemType), inside);
++        } else if (!nested) {
++          const segment = isolateItem(tr, pos);
++          const node = tr.doc.nodeAt(segment);
++          if (node) {
++            tr.setNodeMarkup(segment, undefined, {
++              ...node.attrs,
++              level: Math.min(clampLevel(node.attrs.level) + 1, MAX_LEVELS - 1),
++            });
++          }
++        }
++      } else if (nested) {
++        runAt(tr, liftListItem(itemType), inside);
++      } else if (clampLevel(list.attrs.level) > 0) {
++        const segment = isolateItem(tr, pos);
++        const node = tr.doc.nodeAt(segment);
++        if (node) {
++          tr.setNodeMarkup(segment, undefined, {
++            ...node.attrs,
++            level: clampLevel(node.attrs.level) - 1,
++          });
++        }
++      } else {
++        lift.push(original);
++      }
++    }
++
++    // Items already on the first level leave the list, as before. With
++    // several items this is only done when no other item changed level.
++    if (lift.length && (!tr.docChanged || items.length === 1)) {
++      for (const original of [...lift].reverse()) {
++        runAt(tr, liftListItem(itemType), tr.mapping.map(original, 1) + 1);
++      }
++    }
++
++    if (!tr.docChanged) {
++      return false;
++    }
++    joinSegments(tr, listType);
++    if (dispatch) {
++      keepSelection(state, tr);
++      dispatch(tr.scrollIntoView());
++    }
++    return true;
++  };
++}
++
++/**
++ * Finds the segment just before a position: the last numbered list that is
++ * not nested and ends before it.
++ *
++ * @param doc the document.
++ * @param pos the position.
++ * @param listType the numbered list type.
++ * @returns the segment and its position, or null.
++ */
++export function findPreviousSegment(
++  doc: ProsemirrorNode,
++  pos: number,
++  listType: NodeType
++): { node: ProsemirrorNode; pos: number } | null {
++  let found: { node: ProsemirrorNode; pos: number } | null = null;
++  doc.descendants((node, nodePos) => {
++    if (nodePos >= pos) {
++      return false;
++    }
++    if (node.type === listType) {
++      if (nodePos + node.nodeSize <= pos) {
++        found = { node, pos: nodePos };
++      }
++      return false;
++    }
++    return !node.isTextblock;
++  });
++  return found;
++}
++
++/**
++ * Returns the segment (numbered list that is not nested) around a position.
++ *
++ * @param doc the document.
++ * @param pos the position.
++ * @param listType the numbered list type.
++ * @returns the segment and its position, or null.
++ */
++export function findSegmentAt(
++  doc: ProsemirrorNode,
++  pos: number,
++  listType: NodeType
++): { node: ProsemirrorNode; pos: number } | null {
++  const $pos = doc.resolve(pos);
++  for (let depth = 1; depth <= $pos.depth; depth++) {
++    if ($pos.node(depth).type === listType) {
++      return { node: $pos.node(depth), pos: $pos.before(depth) };
++    }
++  }
++  return null;
++}
++
++/**
++ * Joins the selected paragraphs (and the picked parts) to the numbered list
++ * before them: they become its next items, and the items after them are
++ * numbered on. A numbered list that is selected is joined as a whole.
++ *
++ * @returns the command.
++ */
++export function joinPreviousList(): Command {
++  return (state, dispatch) => {
++    const listType = state.schema.nodes.ordered_list;
++    if (!listType) {
++      return false;
++    }
++    const ranges = targetRanges(state);
++    const first = ranges[0].from;
++    const own = findSegmentAt(state.doc, first, listType);
++    const previous = findPreviousSegment(
++      state.doc,
++      own ? own.pos : first,
++      listType
++    );
++    if (!previous) {
++      return false;
++    }
++    if (!dispatch) {
++      return true;
++    }
++
++    const tr = state.tr;
++    const listId = ensureListId(tr, previous.pos);
++    const base = tr.doc.nodeAt(previous.pos);
++    const attrs = {
++      listId,
++      numbering: base?.attrs.numbering ?? null,
++      listStyle: base?.attrs.listStyle ?? "number",
++    };
++
++    for (const range of ranges) {
++      const from = tr.mapping.map(range.from, 1);
++      const to = Math.max(from, tr.mapping.map(range.to, -1));
++      const segment = findSegmentAt(tr.doc, from, listType);
++      if (segment) {
++        if (segment.node.attrs.listId !== listId) {
++          tr.setNodeMarkup(segment.pos, undefined, {
++            ...segment.node.attrs,
++            ...attrs,
++          });
++        }
++        continue;
++      }
++      runAt(tr, wrapInList(listType, { ...attrs, level: 0 }), from, to);
++    }
++
++    joinSegments(tr, listType);
++    keepSelection(state, tr);
++    dispatch(tr);
++    return true;
++  };
++}
++
++/**
++ * Starts the numbering again at 1 from the segment around the selection: it
++ * and the later segments of its list become a new list.
++ *
++ * @returns the command.
++ */
++export function restartNumbering(): Command {
++  return (state, dispatch) => {
++    const listType = state.schema.nodes.ordered_list;
++    if (!listType) {
++      return false;
++    }
++    const segment = findSegmentAt(state.doc, state.selection.from, listType);
++    if (!segment) {
++      return false;
++    }
++    if (!dispatch) {
++      return true;
++    }
++    const oldId = segment.node.attrs.listId;
++    const listId = newListId();
++    const tr = state.tr;
++    state.doc.descendants((node, pos) => {
++      if (node.type === listType) {
++        if (
++          pos === segment.pos ||
++          (oldId && pos > segment.pos && node.attrs.listId === oldId)
++        ) {
++          tr.setNodeMarkup(pos, undefined, {
++            ...node.attrs,
++            listId,
++            order: pos === segment.pos ? 1 : node.attrs.order,
++          });
++        }
++        return false;
++      }
++      return !node.isTextblock;
++    });
++    dispatch(tr);
++    return true;
++  };
++}
++
++/**
++ * Returns the lists and levels of the selected numbered items (and the picked
++ * ones).
++ *
++ * @param state the editor state.
++ * @param numbering the numbering of the document.
++ * @returns the levels of each list.
++ */
++function selectedLevels(
++  state: EditorState,
++  numbering: Numbering
++): Map<string, Set<number>> {
++  const listType = state.schema.nodes.ordered_list;
++  const result = new Map<string, Set<number>>();
++  if (!listType) {
++    return result;
++  }
++  const positions = new Set(
++    findNumberedItems(state.doc, targetRanges(state), listType)
++  );
++  for (const item of numbering.items) {
++    if (positions.has(item.pos)) {
++      const levels = result.get(item.key) ?? new Set<number>();
++      levels.add(item.level);
++      result.set(item.key, levels);
++    }
++  }
++  return result;
++}
++
++/**
++ * Changes the numbering configuration of the lists of the selected items, on
++ * all their segments, so that every item of the list follows it.
++ *
++ * @param update returns the new configuration of a list from the old one and
++ * the levels selected in it.
++ * @param listStyle the list style to write on every list node too, if any.
++ * @returns the command.
++ */
++export function updateNumbering(
++  update: (config: NumberingConfig, levels: Set<number>) => NumberingConfig,
++  listStyle?: string
++): Command {
++  return (state, dispatch) => {
++    const listType = state.schema.nodes.ordered_list;
++    if (!listType) {
++      return false;
++    }
++    const numbering = computeNumbering(state.doc);
++    const levels = selectedLevels(state, numbering);
++    if (!levels.size) {
++      return false;
++    }
++    if (!dispatch) {
++      return true;
++    }
++    const tr = state.tr;
++    for (const [key, selected] of levels) {
++      const config = update({ ...(numbering.configs.get(key) ?? {}) }, selected);
++      const value = toNumberingConfig(config);
++      for (const list of numbering.lists) {
++        if (list.key !== key) {
++          continue;
++        }
++        const node = tr.doc.nodeAt(list.pos);
++        if (!node) {
++          continue;
++        }
++        const attrs = { ...node.attrs };
++        if (list.topLevel) {
++          attrs.numbering = value;
++        }
++        if (listStyle) {
++          attrs.listStyle = listStyle;
++        }
++        tr.setNodeMarkup(list.pos, undefined, attrs);
++      }
++    }
++    keepSelection(state, tr);
++    dispatch(tr);
++    return true;
++  };
++}
++
++/**
++ * Sets a value of the selected levels in a configuration.
++ *
++ * @param config the configuration.
++ * @param levels the selected levels.
++ * @param value the values to set.
++ * @returns the new configuration.
++ */
++export function setLevelValue(
++  config: NumberingConfig,
++  levels: Set<number>,
++  value: LevelConfig
++): NumberingConfig {
++  const list: LevelConfig[] = [...(config.levels ?? [])];
++  for (const level of levels) {
++    while (list.length <= level) {
++      list.push({});
++    }
++    const next: LevelConfig = { ...list[level], ...value };
++    if (next.type === "auto") {
++      delete next.type;
++    }
++    if (!next.color) {
++      delete next.color;
++    }
++    list[level] = next;
++  }
++  return { ...config, levels: list };
++}
++
++/**
++ * Sets the kind of numbers of the selected levels.
++ *
++ * @param type the kind, e.g. "abjad".
++ * @returns the command.
++ */
++export function setNumberType(type: NumberType): Command {
++  return updateNumbering((config, levels) =>
++    setLevelValue(config, levels, { type })
++  );
++}
++
++/**
++ * Sets the color of the numbers of the selected levels.
++ *
++ * @param color the color, or null for the color of the text.
++ * @returns the command.
++ */
++export function setNumberColor(color: string | null): Command {
++  return updateNumbering((config, levels) =>
++    setLevelValue(config, levels, { color })
++  );
++}
++
++/**
++ * Sets the suffix of the numbers of the whole list: "." ")" or "-".
++ *
++ * @param suffix the suffix.
++ * @returns the command.
++ */
++export function setNumberSuffix(suffix: NumberSuffix): Command {
++  return updateNumbering(
++    (config) => ({ ...config, suffix }),
++    SUFFIX_STYLE[suffix]
++  );
++}
++
++/**
++ * Shows or hides the numbers of the levels above (1.2.1 or 1).
++ *
++ * @returns the command.
++ */
++export function toggleFullNumber(): Command {
++  return updateNumbering((config) => ({ ...config, full: !config.full }));
++}
++
++/** What the menu shows for the numbered item at the selection. */
++export type NumberingAtSelection = {
++  key: string;
++  level: number;
++  dir: "rtl" | "ltr";
++  type: Exclude<NumberType, "auto">;
++  /** Whether the kind was chosen (not the default of the level). */
++  typeChosen: boolean;
++  suffix: NumberSuffix;
++  full: boolean;
++  color: string | null;
++  label: string;
++};
++
++/**
++ * Returns the numbering of the numbered item at the selection.
++ *
++ * @param state the editor state.
++ * @param fallbackDir the direction of a list that has no text yet.
++ * @returns the numbering, or null outside numbered lists.
++ */
++export function getNumberingAtSelection(
++  state: EditorState,
++  fallbackDir: "rtl" | "ltr" = "ltr"
++): NumberingAtSelection | null {
++  const listType = state.schema.nodes.ordered_list;
++  if (!listType) {
++    return null;
++  }
++  const { from } = state.selection;
++  const [pos] = findNumberedItems(state.doc, [{ from, to: from }], listType);
++  if (pos === undefined) {
++    return null;
++  }
++  const numbering = computeNumbering(state.doc, fallbackDir);
++  const item = numbering.items.find((i) => i.pos === pos);
++  if (!item) {
++    return null;
++  }
++  const config = numbering.configs.get(item.key) ?? null;
++  const list = state.doc.nodeAt(item.listPos);
++  const chosen = config?.levels?.[item.level]?.type;
++  return {
++    key: item.key,
++    level: item.level,
++    dir: item.dir,
++    type: resolveNumberType(chosen, item.level, item.dir),
++    typeChosen: !!chosen && chosen !== "auto",
++    suffix:
++      config?.suffix ?? STYLE_SUFFIX[String(list?.attrs.listStyle)] ?? ".",
++    full: !!config?.full,
++    color: item.color,
++    label: item.label,
++  };
++}
++
++/**
++ * Selects the items of one level of a list: their first lines become picked
++ * parts (as with Ctrl), the last one the selection, so the formatting bar and
++ * Tab / Shift+Tab work on all of them. With `toggle` only the clicked item is
++ * added to, or removed from, the parts already picked.
++ *
++ * @param state the editor state.
++ * @param itemPos the position of the clicked item.
++ * @param toggle whether only the clicked item is added or removed.
++ * @returns the transaction, or null.
++ */
++export function selectListLevel(
++  state: EditorState,
++  itemPos: number,
++  toggle = false
++): Transaction | null {
++  const numbering = computeNumbering(state.doc);
++  const clicked = numbering.items.find((i) => i.pos === itemPos);
++  if (!clicked) {
++    return null;
++  }
++  const rangeOf = (pos: number): SelectedRange | null => {
++    const item = state.doc.nodeAt(pos);
++    const block = item?.firstChild;
++    if (!block?.isTextblock || !block.content.size) {
++      return null;
++    }
++    return { from: pos + 2, to: pos + 2 + block.content.size };
++  };
++
++  let ranges: SelectedRange[];
++  if (toggle) {
++    const own = rangeOf(itemPos);
++    const current = [
++      ...getExtraRanges(state),
++      ...(state.selection.empty
++        ? []
++        : [{ from: state.selection.from, to: state.selection.to }]),
++    ];
++    const hit = own
++      ? current.filter((r) => r.from < own.to && r.to > own.from)
++      : [];
++    ranges = hit.length
++      ? current.filter((r) => !hit.includes(r))
++      : own
++        ? [...current, own]
++        : current;
++  } else {
++    ranges = numbering.items
++      .filter((i) => i.key === clicked.key && i.level === clicked.level)
++      .map((i) => rangeOf(i.pos))
++      .filter((r): r is SelectedRange => !!r);
++  }
++  ranges = normalizeRanges(ranges);
++
++  const tr = state.tr;
++  const main = ranges.pop();
++  if (main) {
++    tr.setSelection(TextSelection.create(state.doc, main.from, main.to));
++  } else {
++    tr.setSelection(TextSelection.near(state.doc.resolve(itemPos + 1)));
++  }
++  tr.setMeta(multiSelectionKey, {
++    ranges,
++    gesture: false,
++    held: false,
++  } satisfies MultiSelectionMeta);
++  tr.setMeta("addToHistory", false);
++  return tr;
++}
++
++/**
++ * Writes the start number of every later segment of a list into its `order`
++ * attribute, so that Markdown and HTML without the editor show the same
++ * numbers. Only segments on the first level are changed.
++ *
++ * @param state the editor state.
++ * @returns the transaction, or null when nothing differs.
++ */
++export function syncSegmentStarts(state: EditorState): Transaction | null {
++  const listType = state.schema.nodes.ordered_list;
++  if (!listType) {
++    return null;
++  }
++  const numbering = computeNumbering(state.doc);
++  const seen = new Set<string>();
++  const firstNumber = new Map<number, number>();
++  let tr: Transaction | null = null;
++
++  // The number of the first item of each segment, counted again here
++  // without the formatting.
++  const counts = new Map<string, number>();
++  for (const item of numbering.items) {
++    if (item.level !== 0) {
++      continue;
++    }
++    const list = numbering.lists.find((l) => l.pos === item.listPos);
++    if (!list?.topLevel) {
++      continue;
++    }
++    const node = state.doc.nodeAt(item.listPos);
++    const value = counts.has(item.key)
++      ? (counts.get(item.key) ?? 0) + 1
++      : Number(node?.attrs.order) || 1;
++    counts.set(item.key, value);
++    if (!firstNumber.has(item.listPos)) {
++      firstNumber.set(item.listPos, value);
++    }
++  }
++
++  for (const list of numbering.lists) {
++    if (!list.topLevel || list.level !== 0) {
++      continue;
++    }
++    if (!seen.has(list.key)) {
++      seen.add(list.key);
++      continue;
++    }
++    const node = state.doc.nodeAt(list.pos);
++    const start = firstNumber.get(list.pos);
++    if (node && start !== undefined && node.attrs.order !== start) {
++      tr = tr ?? state.tr;
++      tr.setNodeMarkup(list.pos, undefined, { ...node.attrs, order: start });
++    }
++  }
++  return tr;
++}
+diff --git a/shared/editor/lib/multiSelection.ts b/shared/editor/lib/multiSelection.ts
+index 3d02483..d0057d6 100644
+--- a/shared/editor/lib/multiSelection.ts
++++ b/shared/editor/lib/multiSelection.ts
+@@ -1,4 +1,4 @@
+-// VERSION: 1.1 (2026-10-15) patch 0017-multi-selection
++// VERSION: 1.2 (2026-10-15) patch 0017-multi-selection, 0020-list-numbering-levels
+ import type {
+   Attrs,
+   MarkType,
+@@ -15,6 +15,7 @@ import {
+ import { canJoin } from "prosemirror-transform";
+ import type { EditorView } from "prosemirror-view";
+ import toggleList from "../commands/toggleList";
++import { newListId } from "./listId";
+ 
+ /** A part of the document picked with Ctrl (Cmd on Mac) held. */
+ export type SelectedRange = { from: number; to: number };
+@@ -54,7 +55,20 @@ const BLOCK_COMMANDS = new Set([
+   "checkbox_list",
+   "setTextDirection",
+   "setTextAlignment",
++]);
++
++/**
++ * Numbering commands that act on the picked parts themselves (KMS patch
++ * 0020): the parts are kept for them and they run once.
++ */
++const SELF_COMMANDS = new Set([
+   "setListStyle",
++  "setNumberType",
++  "setNumberColor",
++  "toggleFullNumber",
++  "listLevelDown",
++  "listLevelUp",
++  "joinPreviousList",
+ ]);
+ 
+ /** Commands on text: run once per part. */
+@@ -78,6 +92,7 @@ export function isMultiCommand(name: string): boolean {
+     MARK_COMMANDS.has(name) ||
+     BLOCK_COMMANDS.has(name) ||
+     RANGE_COMMANDS.has(name) ||
++    SELF_COMMANDS.has(name) ||
+     name in NUMBER_COMMANDS
+   );
+ }
+@@ -410,6 +425,10 @@ export function numberRanges(
+   const tr = state.tr;
+   let counter: number | null = null;
+   let style: string | null = listStyle ?? null;
++  // KMS patch 0020: the parts are one list (one list id), so they are
++  // numbered on together also when other content lies between them.
++  let listId: string | null = null;
++  let numbering: unknown = null;
+ 
+   for (const unit of units) {
+     let pos: number;
+@@ -437,11 +456,19 @@ export function numberRanges(
+     }
+     const order: number = counter ?? node.attrs.order;
+     style = style ?? node.attrs.listStyle;
+-    if (node.attrs.order !== order || node.attrs.listStyle !== style) {
++    listId = listId ?? node.attrs.listId ?? newListId();
++    numbering = numbering ?? node.attrs.numbering ?? null;
++    if (
++      node.attrs.order !== order ||
++      node.attrs.listStyle !== style ||
++      node.attrs.listId !== listId
++    ) {
+       tr.setNodeMarkup(pos, undefined, {
+         ...node.attrs,
+         order,
+         listStyle: style,
++        listId,
++        numbering,
+       });
+     }
+     counter = order + node.childCount;
+@@ -481,6 +508,24 @@ export function runMultiCommand(
+   main: Selection,
+   extras: SelectedRange[]
+ ): boolean {
++  if (SELF_COMMANDS.has(name)) {
++    if (!command) {
++      return false;
++    }
++    // Focusing the editor may have dropped the parts: they are set again.
++    view.dispatch(
++      view.state.tr
++        .setSelection(main.map(view.state.doc, view.state.tr.mapping))
++        .setMeta(multiSelectionKey, {
++          ranges: extras,
++          gesture: false,
++        } satisfies MultiSelectionMeta)
++        .setMeta("addToHistory", false)
++    );
++    command(view.state, view.dispatch, view);
++    return true;
++  }
++
+   const { state } = view;
+   const mainRange = rangeOfSelection(main);
+   const ranges = normalizeRanges(mainRange ? [...extras, mainRange] : extras);
+diff --git a/shared/editor/nodes/OrderedList.ts b/shared/editor/nodes/OrderedList.ts
+index e430769..6dc102f 100644
+--- a/shared/editor/nodes/OrderedList.ts
++++ b/shared/editor/nodes/OrderedList.ts
+@@ -6,11 +6,33 @@ import type {
+   Schema,
+   Node as ProsemirrorNode,
+ } from "prosemirror-model";
+-import type { Command } from "prosemirror-state";
+-import { Plugin } from "prosemirror-state";
++import { Fragment, Slice } from "prosemirror-model";
++import type { Command, EditorState } from "prosemirror-state";
++import { Plugin, PluginKey } from "prosemirror-state";
++import type { EditorView } from "prosemirror-view";
+ import { Decoration, DecorationSet } from "prosemirror-view";
++import { isModKey } from "../../utils/keyboard";
+ import { fontFamilies } from "../../utils/textStyle";
+ import toggleList from "../commands/toggleList";
++import { newListId } from "../lib/listId";
++import type { NumberSuffix, NumberType } from "../lib/listNumbering";
++import {
++  NUMBER_TYPES,
++  changeListLevel,
++  computeNumbering,
++  findNumberedItems,
++  joinPreviousList,
++  parseNumberingConfig,
++  restartNumbering,
++  selectListLevel,
++  setNumberColor,
++  setNumberSuffix,
++  setNumberType,
++  syncSegmentStarts,
++  toNumberingConfig,
++  toggleFullNumber,
++} from "../lib/listNumbering";
++import { isRemoteTransaction } from "../lib/multiplayer";
+ import type { MarkdownSerializerState } from "../lib/markdown/serializer";
+ import { listWrappingInputRule } from "../lib/listInputRule";
+ import { findOrderedList } from "../queries/getListDirection";
+@@ -78,22 +100,36 @@ function setListStyle(attrs: unknown): Command {
+     ) {
+       return false;
+     }
+-    const list = findOrderedList(state);
+-    if (!list) {
++    if (!findOrderedList(state)) {
+       return false;
+     }
+-    if (list.node.attrs.listStyle !== listStyle) {
+-      dispatch?.(
+-        state.tr.setNodeMarkup(list.pos, undefined, {
+-          ...list.node.attrs,
+-          listStyle,
+-        })
+-      );
+-    }
+-    return true;
++    // KMS patch 0020: the suffix is set on the whole list (all its segments
++    // and levels), not only on the list node around the cursor.
++    const suffix = (
++      { number: ".", "number-paren": ")", "number-dash": "-" } as Record<
++        string,
++        NumberSuffix
++      >
++    )[listStyle];
++    return setNumberSuffix(suffix)(state, dispatch);
+   };
+ }
+ 
++/**
++ * Reads a string attribute of a command.
++ *
++ * @param attrs the command attributes.
++ * @param name the attribute name.
++ * @returns the value, or null.
++ */
++function stringAttr(attrs: unknown, name: string): string | null {
++  if (attrs && typeof attrs === "object" && name in attrs) {
++    const value = (attrs as Record<string, unknown>)[name];
++    return typeof value === "string" ? value : null;
++  }
++  return null;
++}
++
+ /**
+  * Returns the first text node inside a node.
+  *
+@@ -113,45 +149,308 @@ function firstText(node: ProsemirrorNode): ProsemirrorNode | null {
+   return null;
+ }
+ 
++/** Key of the plugin that draws the numbers (KMS patch 0020). */
++const numberingKey = new PluginKey<DecorationSet>("kmsListNumbering");
++
++/**
++ * The direction of a list that has no text yet: the page direction.
++ *
++ * @returns "rtl" or "ltr".
++ */
++function pageDirection(): "rtl" | "ltr" {
++  return typeof document !== "undefined" &&
++    document.documentElement.dir === "rtl"
++    ? "rtl"
++    : "ltr";
++}
++
++/**
++ * The look of a number: the font, size, weight, slant and color of the start
++ * of the item's text (a heading's size and weight come from the heading
++ * itself, the number being inside it). A color chosen for the level wins.
++ *
++ * @param block the first block of the item.
++ * @param color the color chosen for the level, if any.
++ * @returns CSS declarations.
++ */
++function numberLook(
++  block: ProsemirrorNode | null | undefined,
++  color: string | null
++): string {
++  const text = block ? firstText(block) : null;
++  const style = text?.marks.find((m) => m.type.name === "text_style")?.attrs;
++  const font = style?.fontFamily ? fontFamilies[style.fontFamily] : null;
++  const declarations: string[] = [];
++  if (font) {
++    declarations.push(`font-family: ${font.css}`);
++  }
++  if (style?.fontSize) {
++    declarations.push(`font-size: ${Number(style.fontSize)}px`);
++  }
++  if (text?.marks.some((m) => m.type.name === "strong")) {
++    declarations.push("font-weight: bold");
++  }
++  if (text?.marks.some((m) => m.type.name === "em")) {
++    declarations.push("font-style: italic");
++  }
++  const textColor = typeof style?.color === "string" ? style.color : null;
++  if (color || textColor) {
++    declarations.push(`color: ${color || textColor}`);
++  }
++  return declarations.join("; ");
++}
++
+ /**
+- * Builds decorations that give the number of each list item the font and size
+- * of the item's text, set with the text style mark, through CSS variables read
+- * by the ::marker rule in the editor styles.
++ * Draws a number in the margin of its item, on the side where the list
++ * starts. A click selects the items of its level, Ctrl+click adds or removes
++ * only this item.
++ *
++ * @param label the number with its suffix.
++ * @param dir the direction of the list.
++ * @param look CSS declarations for the font and color.
++ * @returns the element.
++ */
++function renderNumber(
++  label: string,
++  dir: "rtl" | "ltr",
++  look: string
++): HTMLElement {
++  const span = document.createElement("span");
++  span.className = "kms-list-num";
++  span.contentEditable = "false";
++  span.dir = dir;
++  span.textContent = label;
++  span.setAttribute(
++    "style",
++    [look, dir === "rtl" ? "left: 100%" : "right: 100%"]
++      .filter(Boolean)
++      .join("; ")
++  );
++  return span;
++}
++
++/**
++ * Builds the decorations that draw the numbers of all numbered lists: the
++ * list marker is hidden and the computed number is shown instead, at the
++ * start of the item's first line. Segments on a deeper level are indented,
++ * and lists with long numbers get a wider margin.
+  *
+  * @param doc the document.
+  * @returns the decorations.
+  */
+-function buildMarkerDecorations(doc: ProsemirrorNode): DecorationSet {
++function buildNumberDecorations(doc: ProsemirrorNode): DecorationSet {
++  const numbering = computeNumbering(doc, pageDirection());
+   const decorations: Decoration[] = [];
+ 
+-  doc.descendants((node, pos) => {
+-    if (node.type.name !== "ordered_list") {
+-      return true;
++  for (const item of numbering.items) {
++    const node = doc.nodeAt(item.pos);
++    if (!node) {
++      continue;
++    }
++    decorations.push(
++      Decoration.node(item.pos, item.pos + node.nodeSize, {
++        class: "kms-numbered",
++      })
++    );
++    const block = node.firstChild;
++    const at = block?.isTextblock ? item.pos + 2 : item.pos + 1;
++    const look = numberLook(block, item.color);
++    decorations.push(
++      Decoration.widget(at, () => renderNumber(item.label, item.dir, look), {
++        side: -1,
++        marks: [],
++        ignoreSelection: true,
++        stopEvent: () => true,
++        key: `kmsnum:${item.label}:${item.dir}:${look}`,
++      })
++    );
++  }
++
++  for (const list of numbering.lists) {
++    const node = doc.nodeAt(list.pos);
++    if (!node) {
++      continue;
++    }
++    const style: string[] = [];
++    if (list.topLevel && list.level > 0) {
++      // A nested list starts 22px further in (48px padding, -26px margin).
++      style.push(`margin-inline-start: ${-26 + list.level * 22}px`);
++    }
++    if (list.longest > 4) {
++      style.push(
++        `padding-inline-start: calc(48px + ${list.longest - 4} * 0.6em)`
++      );
++    }
++    if (style.length) {
++      decorations.push(
++        Decoration.node(list.pos, list.pos + node.nodeSize, {
++          style: style.join("; "),
++        })
++      );
++    }
++  }
++
++  decorations.push(...buildBodyIndent(doc, numbering));
++  return DecorationSet.create(doc, decorations);
++}
++
++/**
++ * Indents the content that lies between two segments of the same list (KMS
++ * patch 0020 v1.1): it is the text of the last item before it, so it starts
++ * where that item's text starts, at the item's level.
++ *
++ * @param doc the document.
++ * @param numbering the numbering of the document.
++ * @returns node decorations for the blocks between segments.
++ */
++function buildBodyIndent(
++  doc: ProsemirrorNode,
++  numbering: ReturnType<typeof computeNumbering>
++): Decoration[] {
++  const decorations: Decoration[] = [];
++  const longest = new Map(numbering.lists.map((l) => [l.pos, l.longest]));
++  const segments = numbering.lists.filter((l) => l.topLevel);
++
++  for (let i = 0; i < segments.length; i++) {
++    const current = segments[i];
++    const next = segments
++      .slice(i + 1)
++      .find((segment) => segment.key === current.key);
++    const node = doc.nodeAt(current.pos);
++    if (!next || !node) {
++      continue;
++    }
++    // Only content beside the segments, in the same parent, is indented.
++    const $current = doc.resolve(current.pos);
++    const $next = doc.resolve(next.pos);
++    if ($current.depth !== $next.depth || $current.start() !== $next.start()) {
++      continue;
++    }
++    const end = current.pos + node.nodeSize;
++    if (end >= next.pos) {
++      continue;
+     }
+-    node.forEach((item, offset) => {
+-      const from = pos + 1 + offset;
+-      const text = item.firstChild ? firstText(item.firstChild) : null;
+-      const style = text?.marks.find(
+-        (m) => m.type.name === "text_style"
+-      )?.attrs;
+-      const font = style?.fontFamily ? fontFamilies[style.fontFamily] : null;
+-      const size = style?.fontSize;
+-      if (font || size) {
++    // The last item of the list before the content.
++    const last = numbering.items
++      .filter((item) => item.key === current.key && item.pos < end)
++      .pop();
++    if (!last) {
++      continue;
++    }
++    const extra = Math.max((longest.get(last.listPos) ?? 0) - 4, 0);
++    const indent = extra
++      ? `calc(${22 * (last.level + 1)}px + ${extra} * 0.6em)`
++      : `${22 * (last.level + 1)}px`;
++
++    const start = $current.start();
++    $current.parent.forEach((block, offset) => {
++      const pos = start + offset;
++      if (pos >= end && pos + block.nodeSize <= next.pos) {
+         decorations.push(
+-          Decoration.node(from, from + item.nodeSize, {
+-            "data-marker-style": "",
+-            style: [
+-              `--marker-font: ${font ? font.css : "initial"}`,
+-              `--marker-size: ${size ? `${size}px` : "initial"}`,
+-            ].join("; "),
++          Decoration.node(pos, pos + block.nodeSize, {
++            class: "kms-list-body",
++            style: `margin-inline-start: ${indent}`,
+           })
+         );
+       }
+     });
+-    return true;
+-  });
++  }
++  return decorations;
++}
+ 
+-  return DecorationSet.create(doc, decorations);
++/**
++ * Selects the items of a level when its number is clicked (KMS patch 0020).
++ *
++ * @param view the editor view.
++ * @param event the mouse event.
++ */
++function handleNumberMouseDown(view: EditorView, event: MouseEvent) {
++  const target = event.target as HTMLElement | null;
++  const number = target?.closest?.(".kms-list-num");
++  if (!number || event.button !== 0 || !view.dom.contains(number)) {
++    return;
++  }
++  event.preventDefault();
++  event.stopPropagation();
++  if (!view.editable) {
++    return;
++  }
++  let pos: number;
++  try {
++    pos = view.posAtDOM(number, 0);
++  } catch (_err) {
++    return;
++  }
++  const listType = view.state.schema.nodes.ordered_list;
++  const [itemPos] = findNumberedItems(
++    view.state.doc,
++    [{ from: pos, to: pos }],
++    listType
++  );
++  if (itemPos === undefined) {
++    return;
++  }
++  const tr = selectListLevel(view.state, itemPos, isModKey(event));
++  if (tr) {
++    view.focus();
++    view.dispatch(tr);
++  }
++}
++
++/**
++ * Gives pasted lists new list ids, keeping the segments that shared an id
++ * together, so a pasted copy is numbered on its own.
++ *
++ * @param slice the pasted content.
++ * @returns the content with new ids.
++ */
++function renewListIds(slice: Slice): Slice {
++  const ids = new Map<string, string>();
++  const mapFragment = (fragment: Fragment): Fragment => {
++    const nodes: ProsemirrorNode[] = [];
++    fragment.forEach((node) => {
++      if (node.isText) {
++        nodes.push(node);
++        return;
++      }
++      const content = mapFragment(node.content);
++      if (node.type.name === "ordered_list" && node.attrs.listId) {
++        const oldId = String(node.attrs.listId);
++        const newId = ids.get(oldId) ?? newListId();
++        ids.set(oldId, newId);
++        nodes.push(
++          node.type.create({ ...node.attrs, listId: newId }, content, node.marks)
++        );
++        return;
++      }
++      nodes.push(node.copy(content));
++    });
++    return Fragment.fromArray(nodes);
++  };
++  return new Slice(mapFragment(slice.content), slice.openStart, slice.openEnd);
++}
++
++/**
++ * The selection's numbered item: a command that selects the items of its
++ * level.
++ *
++ * @returns the command.
++ */
++function selectLevelOfSelection(): Command {
++  return (state: EditorState, dispatch) => {
++    const listType = state.schema.nodes.ordered_list;
++    const { from } = state.selection;
++    const [itemPos] = findNumberedItems(state.doc, [{ from, to: from }], listType);
++    if (itemPos === undefined) {
++      return false;
++    }
++    const tr = selectListLevel(state, itemPos);
++    if (!tr) {
++      return false;
++    }
++    dispatch?.(tr);
++    return true;
++  };
+ }
+ 
+ export default class OrderedList extends Node {
+@@ -174,6 +473,18 @@ export default class OrderedList extends Node {
+           default: "number",
+           validate: (style: string) => LIST_STYLES.includes(style),
+         },
++        // KMS patch 0020: segments with the same id are numbered as one list;
++        // the level of a segment (0 = first); the numbering of the list
++        // (number type and color per level, suffix, full numbers).
++        listId: {
++          default: null,
++        },
++        level: {
++          default: 0,
++        },
++        numbering: {
++          default: null,
++        },
+       },
+       content: "list_item+",
+       group: "block list",
+@@ -183,11 +494,17 @@ export default class OrderedList extends Node {
+           getAttrs: (dom: HTMLOListElement) => {
+             const listStyle =
+               dom.getAttribute("data-list-style") || dom.style.listStyleType;
++            const level = parseInt(dom.getAttribute("data-list-level") || "0", 10);
+             return {
+               order: dom.hasAttribute("start")
+                 ? parseInt(dom.getAttribute("start") || "1", 10)
+                 : 1,
+               listStyle: LIST_STYLES.includes(listStyle) ? listStyle : "number",
++              listId: dom.getAttribute("data-list-id") || null,
++              level: Number.isInteger(level) && level > 0 ? Math.min(level, 8) : 0,
++              numbering: parseNumberingConfig(
++                dom.getAttribute("data-numbering")
++              ),
+             };
+           },
+         },
+@@ -197,8 +514,22 @@ export default class OrderedList extends Node {
+           start?: number;
+           style?: string;
+           "data-list-style"?: string;
++          "data-list-id"?: string;
++          "data-list-level"?: string;
++          "data-numbering"?: string;
+         } = {};
+ 
++        if (node.attrs.listId) {
++          attrs["data-list-id"] = String(node.attrs.listId);
++        }
++        if (node.attrs.level) {
++          attrs["data-list-level"] = String(node.attrs.level);
++        }
++        const numbering = toNumberingConfig(node.attrs.numbering);
++        if (numbering) {
++          attrs["data-numbering"] = JSON.stringify(numbering);
++        }
++
+         if (node.attrs.order !== 1) {
+           attrs.start = node.attrs.order;
+         }
+@@ -222,15 +553,39 @@ export default class OrderedList extends Node {
+   get plugins() {
+     return [
+       new Plugin<DecorationSet>({
++        key: numberingKey,
+         state: {
+-          init: (_, state) => buildMarkerDecorations(state.doc),
++          init: (_, state) => buildNumberDecorations(state.doc),
+           apply: (tr, value) =>
+-            tr.docChanged ? buildMarkerDecorations(tr.doc) : value,
++            tr.docChanged ? buildNumberDecorations(tr.doc) : value,
+         },
+         props: {
+           decorations(state) {
+             return this.getState(state);
+           },
++          transformPasted: (slice) => renewListIds(slice),
++        },
++        // Later segments of a list keep their start number in `order`, for
++        // Markdown and HTML without the editor. Not for remote changes: the
++        // client that made the change writes it.
++        appendTransaction: (transactions, _oldState, newState) => {
++          if (
++            !transactions.some((tr) => tr.docChanged) ||
++            transactions.some((tr) => isRemoteTransaction(tr, newState))
++          ) {
++            return null;
++          }
++          return syncSegmentStarts(newState);
++        },
++        view: (view) => {
++          const onMouseDown = (event: MouseEvent) =>
++            handleNumberMouseDown(view, event);
++          const dom = view.dom;
++          dom.addEventListener("mousedown", onMouseDown, true);
++          return {
++            destroy: () =>
++              dom.removeEventListener("mousedown", onMouseDown, true),
++          };
+         },
+       }),
+     ];
+@@ -247,6 +602,23 @@ export default class OrderedList extends Node {
+         toggleList(type, schema.nodes.list_item, "upper-alpha"),
+ 
+       setListStyle: (attrs?: unknown) => setListStyle(attrs),
++
++      // KMS patch 0020: multi-level numbering.
++      setNumberType: (attrs?: unknown) => {
++        const type = stringAttr(attrs, "type");
++        return type &&
++          (type === "auto" || (NUMBER_TYPES as string[]).includes(type))
++          ? setNumberType(type as NumberType)
++          : () => false;
++      },
++      setNumberColor: (attrs?: unknown) =>
++        setNumberColor(stringAttr(attrs, "color")),
++      toggleFullNumber: () => toggleFullNumber(),
++      listLevelDown: () => changeListLevel(1),
++      listLevelUp: () => changeListLevel(-1),
++      joinPreviousList: () => joinPreviousList(),
++      restartNumbering: () => restartNumbering(),
++      selectListLevel: () => selectLevelOfSelection(),
+     };
+   }
+ 
+@@ -255,6 +627,12 @@ export default class OrderedList extends Node {
+       "Shift-Ctrl-9": toggleList(type, schema.nodes.list_item),
+       "Shift-Ctrl-5": this.commands({ type, schema }).toggleUpperLetterList(),
+       "Shift-Ctrl-6": this.commands({ type, schema }).toggleLowerLetterList(),
++      // KMS patch 0020: next / previous level, also for the first item of a
++      // list and for all picked items; other lists are left to ListItem.
++      Tab: changeListLevel(1),
++      "Shift-Tab": changeListLevel(-1),
++      "Mod-]": changeListLevel(1),
++      "Mod-[": changeListLevel(-1),
+     };
+   }
+ 
+diff --git a/shared/i18n/locales/fa_IR/translation.json b/shared/i18n/locales/fa_IR/translation.json
+index 8f76e35..7fcbcd9 100644
+--- a/shared/i18n/locales/fa_IR/translation.json
++++ b/shared/i18n/locales/fa_IR/translation.json
+@@ -1968,6 +1968,19 @@
+   "Date format": "قالب تاریخ",
+   "Choose how dates are written.": "نحوه‌ی نوشتن تاریخ‌ها را انتخاب کنید.",
+   "Number style": "قالب شماره‌گذاری",
++  "Numbering": "شماره‌گذاری",
++  "Default": "پیش‌فرض",
++  "Number type": "نوع شماره",
++  "Persian alphabet": "الفبایی",
++  "Abjad": "ابجد",
++  "Full number": "شماره‌ی کامل",
++  "Number color": "رنگ شماره",
++  "Same as text": "هم‌رنگ متن",
++  "Next level": "سطح بعد",
++  "Previous level": "سطح قبل",
++  "Select all items of this level": "انتخاب همه‌ی اعضای این سطح",
++  "Join previous numbering": "پیوستن به شماره‌گذاری قبلی",
++  "Restart numbering": "شروع دوباره از ۱",
+   "Reset zoom": "بازنشانی بزرگ‌نمایی",
+   "Document zoom": "بزرگ‌نمایی سند",
+   "Sidebar size": "اندازه منوی کناری",

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Wed, 14 Oct 2026 19:30:00 +0330
+Subject: [PATCH 16/18] fix(editor): math formulas were mirrored on right-to-left pages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.0 (2026-10-14)
+Root: build/outline-1.11.0 (apply after 0001..0015)
+
+Problem: in a right-to-left document the parts of a formula were laid out in
+reverse order (for example "R = a x 100" was shown as "100 x a = R"), and
+Persian words inside \text{} came out scrambled.
+
+Cause: KaTeX output inherits the page direction, and the bidi algorithm then
+reorders the neutral operators (=, +, x) between the left-to-right runs.
+
+Fix (CSS only): .math-node, .katex and .katex-display are always
+direction: ltr with unicode-bidi: isolate, like inline code (patch 0001).
+The text around a formula keeps its own direction.
+
+Files (1; N = new, M = modified, D = deleted):
+  M shared/editor/components/Styles.ts
+
+---
+---
+
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index 42c5278..6db584f 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -58,6 +58,16 @@ const mathStyle = (props: Props) => css`
+     white-space: pre-wrap;
+     overflow-x: auto;
+     overflow-y: hidden;
++    direction: ltr;
++    unicode-bidi: isolate;
++  }
++
++  /* Formulas are always left-to-right and isolated, so an RTL page does not
++     reverse the order of their parts (KMS patch 0016). */
++  .katex,
++  .katex-display {
++    direction: ltr;
++    unicode-bidi: isolate;
+   }
+ 
+   .math-node.empty-math .math-render::before {

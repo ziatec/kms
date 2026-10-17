@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Wed, 14 Oct 2026 14:20:00 +0330
+Subject: [PATCH 15/18] fix(editor): "Hide completed" button of to-do lists covered the first item
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.0 (2026-10-14)
+Root: build/outline-1.11.0 (apply after 0001..0014)
+
+Problem: in a right-to-left to-do list the first item could not be unticked,
+and the "Hide completed" / "Show N completed" button popped up over the text
+whenever the pointer crossed the list.
+
+Cause: the button was placed with a physical right: 0, top: -8px over the
+first line. In RTL that is where the first item's checkbox and text start, so
+the button covered the checkbox. It also caught clicks while invisible
+(opacity 0) and appeared at once on hover.
+
+Fix (CSS only):
+- The button sits just above the list at the end of the first line (left in
+  RTL, right in LTR, following the wrapper direction; a list with an explicit
+  dir from ListDirection uses that list's end side), where the last line of
+  the text before the list usually stops. It no longer covers any item.
+- While invisible it is click-through (pointer-events: none).
+- On hover it appears after 400 ms, so moving across a list does not flash
+  it. When completed items are hidden it stays visible as before.
+- Tables keep their own offset.
+
+Files (1; N = new, M = modified, D = deleted):
+  M shared/editor/components/Styles.ts
+
+---
+---
+
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index 60aa896..42c5278 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -1599,11 +1599,17 @@ li .${EditorStyleHelper.checklistWrapper} {
+   margin: 0;
+ }
+ 
++/* The "Hide completed" button sits just above the list at the end of its
++   first line, where the last line of the text before it usually stops, so it
++   never covers the items or the first checkbox, in either direction. It is
++   click-through while invisible (KMS patch 0015). */
+ .${EditorStyleHelper.checklistCompletedToggle} {
+   position: absolute;
+-  top: -8px;
+-  right: 0;
+-  padding: 4px 8px;
++  top: calc(-1em - 14px);
++  inset-inline-start: auto;
++  inset-inline-end: 0;
++  white-space: nowrap;
++  padding: 2px 8px;
+   font-size: 12px;
+   background: ${props.theme.background};
+   border: 1px solid ${props.theme.buttonNeutralBorder};
+@@ -1613,7 +1619,8 @@ li .${EditorStyleHelper.checklistWrapper} {
+   user-select: none;
+   z-index: 1;
+   opacity: 0;
+-  transition: all 100ms ease-in-out;
++  pointer-events: none;
++  transition: opacity 150ms ease-in-out;
+ 
+   &:${hover} {
+     background: ${props.theme.buttonNeutralBackground};
+@@ -1625,13 +1632,31 @@ li .${EditorStyleHelper.checklistWrapper} {
+   }
+ }
+ 
++/* Shown after a short pause, so moving the pointer over a list does not
++   flash it. */
+ .${EditorStyleHelper.checklistWrapper}:${hover} .${EditorStyleHelper.checklistCompletedToggle},
+ .${EditorStyleHelper.checklistWrapper}:focus-within .${EditorStyleHelper.checklistCompletedToggle} {
+   opacity: 1;
++  pointer-events: auto;
++  transition-delay: 400ms;
+ }
+ 
+ .${EditorStyleHelper.checklistWrapper}.${EditorStyleHelper.checklistCompletedHidden} .${EditorStyleHelper.checklistCompletedToggle} {
+   opacity: 1;
++  pointer-events: auto;
++  transition-delay: 0ms;
++}
++
++/* A list whose explicit direction (ListDirection) differs from the text
++   around it: the button goes to that list's own end side. */
++.${EditorStyleHelper.checklistWrapper}:has(> ul.checkbox_list[dir="rtl"]) .${EditorStyleHelper.checklistCompletedToggle} {
++  left: 0;
++  right: auto;
++}
++
++.${EditorStyleHelper.checklistWrapper}:has(> ul.checkbox_list[dir="ltr"]) .${EditorStyleHelper.checklistCompletedToggle} {
++  left: auto;
++  right: 0;
+ }
+ 
+ td .${EditorStyleHelper.checklistCompletedToggle},

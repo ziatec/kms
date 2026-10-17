@@ -1,0 +1,1437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Thu, 15 Oct 2026 04:20:00 +0330
+Subject: [PATCH 17/18] feat(editor): pick separate parts with Ctrl and format them together
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.7 (2026-10-15)  1.7: the formatting bar is never lost: it is placed
+  again on every scroll (any scroll area) and window resize, so it follows the
+  selection; while the selection is out of view it stays at the top or bottom of
+  the window. When Ctrl is released after picking parts it appears next to the
+  last picked part.
+  1.6: a second Ctrl+drag (mouse released, Ctrl held) no
+  longer selects all the text between the two parts (Firefox keeps one native range per
+  Ctrl+drag and ProseMirror joined them; the native selection is emptied on Ctrl+press
+  and the last drag is taken on release).
+  1.5: Ctrl + double/triple click on a picked part removes
+  it (and every part the selected word, line or paragraph overlaps).
+  1.4: the formatting bar did not appear when Ctrl was
+  released (the toolbar re-renders only on a new selection object; it is set anew).
+  1.3: while Ctrl is held after a Ctrl click the formatting
+  bar is hidden (it no longer blocks picking the next line); it appears when Ctrl is
+  released. The see-through bar of 1.2 is removed; the bar still moves under the
+  selection when it would cover a picked part.
+  1.2: the bar moves under the selection or is see-through.
+  1.1: Ctrl + double/triple click (whole line) no longer
+  drops the parts picked before; the browser's late selection after a triple click
+  keeps them too (picking ends with a click without Ctrl or a cursor key).
+Root: build/outline-1.11.0 (apply after 0001..0016)
+
+Picking (MultiSelection extension):
+- Hold Ctrl (Cmd on Mac) and select text with the mouse to add it to the
+  parts already picked; Ctrl+click, double or triple click on a paragraph
+  picks the whole paragraph.
+- Ctrl+click (or Ctrl + double/triple click) on a picked part removes it. Escape, a click without Ctrl, an
+  arrow key or typing drops all parts.
+- Picked parts are shaded with the system highlight color; the last one is
+  the editor selection, so the formatting toolbar stays open.
+- The formatting toolbar is hidden while Ctrl stays held after a Ctrl
+  click and appears when Ctrl is released, next to the last picked part. It
+  moves under the selection when above it would cover a picked part.
+- The toolbar follows the selection when the page scrolls; while the
+  selection is out of view it stays at the top or bottom of the window.
+
+Applied to all parts at once (one undo step; the parts stay picked):
+- Bold, italic, underline, strikethrough, inline code, highlight color: when
+  every part already has it, it is removed from all, otherwise set on all.
+- Font, size and text color (setTextStyle), text direction, alignment,
+  headings, quote, bullet and to-do lists, number style.
+- Toolbar, context menu and the shortcuts Ctrl+B/I/U/D/E, Ctrl+Shift+H,
+  Ctrl+Shift+7/8/9.
+
+Numbering (ordered_list, a. / A. lists):
+- The parts are numbered as one sequence in document order. A part inside a
+  numbered list keeps it and the numbers go on after that list's last item:
+  item 3 picked with two more paragraphs gives them 4 and 5.
+- Unnumbered parts become numbered lists that start where the previous part
+  ended (the first at 1), using the same number style; the text between
+  them is untouched. A new list right after the one before it is joined.
+- When every part is already numbered, the numbering is removed.
+
+Files (7; N = new, M = modified, D = deleted):
+  M app/editor/components/FloatingToolbar.tsx
+  M shared/editor/components/Styles.ts
+  N shared/editor/extensions/MultiSelection.ts
+  M shared/editor/lib/ExtensionManager.ts
+  N shared/editor/lib/multiSelection.test.ts
+  N shared/editor/lib/multiSelection.ts
+  M shared/editor/nodes/index.ts
+
+---
+---
+
+diff --git a/app/editor/components/FloatingToolbar.tsx b/app/editor/components/FloatingToolbar.tsx
+index 248dfcc..df32705 100644
+--- a/app/editor/components/FloatingToolbar.tsx
++++ b/app/editor/components/FloatingToolbar.tsx
+@@ -15,6 +15,7 @@ import useMobile from "~/hooks/useMobile";
+ import Logger from "~/utils/Logger";
+ import { useEditor } from "./EditorContext";
+ import { getDocZoom } from "@shared/utils/zoom";
++import { getExtraRanges, isPicking } from "@shared/editor/lib/multiSelection";
+ import {
+   getColumnBounds,
+   getColumnIndex,
+@@ -39,8 +40,58 @@ const defaultPosition = {
+   maxWidth: 1000,
+   blockSelection: false,
+   visible: false,
++  /** Shown under the selection, so that it does not cover picked parts. */
++  below: false,
+ };
+ 
++type Box = { left: number; right: number; top: number; bottom: number };
++
++/**
++ * Returns the screen boxes of the parts picked with Ctrl besides the
++ * selection (KMS patch 0017). A part over several lines spans the editor
++ * width.
++ *
++ * @param view the editor view.
++ * @returns the boxes, empty when nothing else is picked.
++ */
++function pickedBoxes(view: ReturnType<typeof useEditor>["view"]): Box[] {
++  const boxes: Box[] = [];
++  const editorBox = view.dom.getBoundingClientRect();
++  for (const range of getExtraRanges(view.state)) {
++    try {
++      const start = view.coordsAtPos(range.from);
++      const end = view.coordsAtPos(range.to, -1);
++      const oneLine = Math.abs(start.top - end.top) < 2;
++      boxes.push({
++        left: oneLine ? Math.min(start.left, end.left) : editorBox.left,
++        right: oneLine ? Math.max(start.right, end.right) : editorBox.right,
++        top: Math.min(start.top, end.top),
++        bottom: Math.max(start.bottom, end.bottom),
++      });
++    } catch (_err) {
++      // A part that is not rendered is skipped.
++    }
++  }
++  return boxes;
++}
++
++/**
++ * Whether a box overlaps any of the given boxes.
++ *
++ * @param box the box.
++ * @param boxes the other boxes.
++ * @returns true when they overlap.
++ */
++function overlapsAny(box: Box, boxes: Box[]): boolean {
++  return boxes.some(
++    (other) =>
++      box.left < other.right &&
++      box.right > other.left &&
++      box.top < other.bottom &&
++      box.bottom > other.top
++  );
++}
++
+ function usePosition({
+   menuRef,
+   active,
+@@ -208,7 +259,7 @@ function usePosition({
+           : selectionBounds.right
+     )
+   );
+-  const top = Math.max(
++  let top = Math.max(
+     HEADER_HEIGHT,
+     Math.min(
+       window.innerHeight - menuHeight - margin,
+@@ -216,6 +267,29 @@ function usePosition({
+     )
+   );
+ 
++  // With parts picked with Ctrl (KMS patch 0017) the bar should not hide
++  // them: it moves under the selection when that place is free.
++  let below = false;
++  const picked = pickedBoxes(view);
++  if (picked.length) {
++    const boxAt = (y: number): Box => ({
++      left,
++      right: left + menuWidth,
++      top: y - 6,
++      bottom: y + menuHeight,
++    });
++    if (overlapsAny(boxAt(top), picked)) {
++      const under = selectionBounds.bottom + 14;
++      if (
++        under + menuHeight <= window.innerHeight - margin &&
++        !overlapsAny(boxAt(under), picked)
++      ) {
++        top = under;
++        below = true;
++      }
++    }
++  }
++
+   // if the menu has been offset to not extend offscreen then we should adjust
+   // the position of the triangle underneath to correctly point to the center
+   // of the selection still
+@@ -232,6 +306,7 @@ function usePosition({
+       noticeBlock
+     ),
+     visible: true,
++    below,
+   };
+ }
+ 
+@@ -246,10 +321,43 @@ function FloatingToolbar({ ref, ...props }: Props) {
+     align: props.align,
+   });
+ 
+-  if (isSelectingText) {
++  // While parts are picked with Ctrl held (KMS patch 0017) the bar waits
++  // until Ctrl is released, so it does not cover the text still to pick.
++  const { view } = useEditor();
++  if (isSelectingText || isPicking(view.state)) {
+     position = defaultPosition;
+   }
+ 
++  // The position is measured in screen coordinates, so it is measured again
++  // (once per frame) when anything scrolls or the window is resized, and
++  // when Ctrl is released after picking parts (KMS patch 0017 v1.7). The bar
++  // follows the selection, and stays at the top or bottom of the window
++  // while the selection is scrolled out of view, so it is never lost.
++  const [, setFrame] = React.useState(0);
++  const frameRef = React.useRef(0);
++  const activeRef = React.useRef(props.active);
++  activeRef.current = props.active;
++  const reposition = React.useCallback(() => {
++    if (!activeRef.current || frameRef.current) {
++      return;
++    }
++    frameRef.current = requestAnimationFrame(() => {
++      frameRef.current = 0;
++      setFrame((n) => n + 1);
++    });
++  }, []);
++  React.useEffect(() => () => cancelAnimationFrame(frameRef.current), []);
++  useEventListener("scroll", reposition, window, {
++    capture: true,
++    passive: true,
++  });
++  useEventListener("resize", reposition);
++  useEventListener("keyup", (event: KeyboardEvent) => {
++    if (event.key === "Control" || event.key === "Meta") {
++      reposition();
++    }
++  });
++
+   useEventListener("mouseup", () => {
+     setSelectingText(false);
+   });
+@@ -328,7 +436,11 @@ function FloatingToolbar({ ref, ...props }: Props) {
+     <Portal>
+       <Wrapper
+         active={props.active && position.visible}
+-        arrow={!!props.children && !position.blockSelection}
++        arrow={
++          !!props.children &&
++          !position.blockSelection &&
++          !("below" in position && position.below)
++        }
+         ref={menuRef}
+         $offset={position.offset}
+         style={{
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index 6db584f..216e2c5 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -1000,6 +1000,12 @@ th .image .image-wrapper img {
+   cursor: col-resize;
+ }
+ 
++/* Parts picked with Ctrl/Cmd besides the selection (MultiSelection) */
++.multi-selection {
++  background: color-mix(in srgb, Highlight 40%, transparent);
++  border-radius: 2px;
++}
++
+ .ProseMirror-hideselection *::selection {
+   background: transparent;
+ }
+diff --git a/shared/editor/extensions/MultiSelection.ts b/shared/editor/extensions/MultiSelection.ts
+new file mode 100644
+index 0000000..f7faf8b
+--- /dev/null
++++ b/shared/editor/extensions/MultiSelection.ts
+@@ -0,0 +1,407 @@
++// VERSION: 1.5 (2026-10-15) patch 0017-multi-selection
++import type { Command } from "prosemirror-state";
++import { Plugin, TextSelection } from "prosemirror-state";
++import type { EditorView } from "prosemirror-view";
++import { Decoration, DecorationSet } from "prosemirror-view";
++import { isMac } from "../../utils/browser";
++import { isModKey } from "../../utils/keyboard";
++import Extension from "../lib/Extension";
++import type {
++  MultiSelectionMeta,
++  MultiSelectionState,
++  SelectedRange,
++} from "../lib/multiSelection";
++import {
++  getExtraRanges,
++  mapRanges,
++  multiSelectionKey,
++  normalizeRanges,
++  rangeOfSelection,
++} from "../lib/multiSelection";
++
++const EMPTY: MultiSelectionState = { ranges: [], gesture: false, held: false };
++
++/** The key that picks parts: Cmd on Mac, Ctrl elsewhere. */
++const MOD_KEY = isMac ? "Meta" : "Control";
++
++/** Views that listen for the release of Ctrl/Cmd. */
++const watching = new WeakSet<EditorView>();
++
++/**
++ * Hides the formatting toolbar until Ctrl/Cmd is released, so it does not
++ * cover the text still to be picked.
++ *
++ * @param view the editor view.
++ */
++function holdUntilRelease(view: EditorView) {
++  if (watching.has(view)) {
++    return;
++  }
++  watching.add(view);
++  const ownerWindow = view.dom.ownerDocument.defaultView ?? window;
++  const release = () => {
++    watching.delete(view);
++    ownerWindow.removeEventListener("keyup", onKeyUp, true);
++    ownerWindow.removeEventListener("mousemove", onMove, true);
++    ownerWindow.removeEventListener("blur", release);
++    if (!view.isDestroyed && multiSelectionKey.getState(view.state)?.held) {
++      // The toolbar only renders again when the selection object changes, so
++      // the same selection is set anew.
++      const { state } = view;
++      const tr = state.tr;
++      view.dispatch(
++        tr
++          .setSelection(state.selection.map(tr.doc, tr.mapping))
++          .setMeta(multiSelectionKey, { held: false } satisfies MultiSelectionMeta)
++          .setMeta("addToHistory", false)
++      );
++    }
++  };
++  const onKeyUp = (event: KeyboardEvent) => {
++    if (event.key === MOD_KEY || !isModKey(event)) {
++      release();
++    }
++  };
++  // A release missed (e.g. outside the window) is seen on the next move.
++  const onMove = (event: MouseEvent) => {
++    if (!isModKey(event)) {
++      release();
++    }
++  };
++  ownerWindow.addEventListener("keyup", onKeyUp, true);
++  ownerWindow.addEventListener("mousemove", onMove, true);
++  ownerWindow.addEventListener("blur", release);
++}
++
++/** Meta of the collaboration plugin on remote changes. */
++const Y_SYNC_META = "y-sync$";
++
++/** Keys that change the text: typing them drops the other parts. */
++const EDIT_KEYS = new Set(["Backspace", "Delete", "Enter", "Tab"]);
++
++/** Keys that move the cursor: they end picking with the mouse. */
++const MOVE_KEYS = new Set([
++  "ArrowLeft",
++  "ArrowRight",
++  "ArrowUp",
++  "ArrowDown",
++  "Home",
++  "End",
++  "PageUp",
++  "PageDown",
++]);
++
++/**
++ * The parts picked before the first click of a double or triple click, by
++ * view: the later clicks of the series only grow the same selection.
++ */
++const clickSeries = new WeakMap<EditorView, SelectedRange[]>();
++
++/**
++ * Views whose current click series started on a picked part: the double or
++ * triple click then removes what it covers instead of picking it.
++ */
++const deselectSeries = new WeakSet<EditorView>();
++
++/**
++ * Sets the multi-selection state.
++ *
++ * @param view the editor view.
++ * @param meta the new state.
++ */
++function setRanges(view: EditorView, meta: MultiSelectionMeta) {
++  view.dispatch(
++    view.state.tr
++      .setMeta(multiSelectionKey, meta)
++      .setMeta("addToHistory", false)
++  );
++}
++
++/**
++ * Firefox keeps a native range for every Ctrl+drag, and ProseMirror then
++ * reads one selection from the first to the last of them, which also covers
++ * the text in between. Returns the range of the last drag: the native range
++ * that is not one of the picked parts.
++ *
++ * @param view the editor view.
++ * @param extras the picked parts.
++ * @returns the part of the last drag, or null when there is one native range.
++ */
++function newDomRange(
++  view: EditorView,
++  extras: SelectedRange[]
++): SelectedRange | null {
++  const domSelection = (view.root as Document).getSelection?.();
++  if (!domSelection || domSelection.rangeCount < 2) {
++    return null;
++  }
++  for (let i = domSelection.rangeCount - 1; i >= 0; i--) {
++    const range = domSelection.getRangeAt(i);
++    if (range.collapsed) {
++      continue;
++    }
++    try {
++      const from = view.posAtDOM(range.startContainer, range.startOffset, 1);
++      const to = view.posAtDOM(range.endContainer, range.endOffset, -1);
++      if (
++        to > from &&
++        !extras.some((r) => r.from < to && r.to > from)
++      ) {
++        return { from, to };
++      }
++    } catch (_err) {
++      // A range outside the editor is skipped.
++    }
++  }
++  return null;
++}
++
++/**
++ * Ends a Ctrl/Cmd click: the new selection is added to the parts, or a part
++ * clicked again is removed (a double or triple click that starts on a picked
++ * part removes every part in the word, line or paragraph it selects). The editor selection always holds
++ * one of the parts, so the formatting toolbar stays open.
++ *
++ * @param view the editor view.
++ * @param clicks 1 for a click, 2 or 3 for a double or triple click.
++ */
++function endGesture(view: EditorView, clicks: number) {
++  if (view.isDestroyed) {
++    return;
++  }
++  const { state } = view;
++  const { selection } = state;
++  let extras = getExtraRanges(state);
++  let main: SelectedRange | null =
++    newDomRange(view, extras) ?? rangeOfSelection(selection);
++
++  // A part picked again (or clicked inside) with a single click is removed.
++  // The later clicks of a series that started on a picked part remove all
++  // parts the selected word, line or paragraph overlaps.
++  const deselecting = clicks > 1 && deselectSeries.has(view);
++  const hit = deselecting
++    ? extras.filter((r) =>
++        main
++          ? r.from < main.to && r.to > main.from
++          : selection.from >= r.from && selection.from <= r.to
++      )
++    : (clicks > 1 ? [] : extras).filter((r) =>
++        main
++          ? main.from >= r.from && main.to <= r.to
++          : selection.from >= r.from && selection.from <= r.to
++      );
++  if (clicks === 1) {
++    if (hit.length) {
++      deselectSeries.add(view);
++    } else {
++      deselectSeries.delete(view);
++    }
++  }
++  if (hit.length || deselecting) {
++    extras = extras.filter((r) => !hit.includes(r));
++    main = null;
++  } else if (main) {
++    const m = main;
++    extras = extras.filter((r) => r.to <= m.from || r.from >= m.to);
++  }
++  if (!main && extras.length) {
++    main = extras[extras.length - 1];
++    extras = extras.slice(0, -1);
++  }
++
++  const tr = state.tr
++    .setMeta(multiSelectionKey, { ranges: extras } satisfies MultiSelectionMeta)
++    .setMeta("addToHistory", false);
++  if (main) {
++    tr.setSelection(TextSelection.create(state.doc, main.from, main.to));
++  } else if (hit.length || deselecting) {
++    tr.setSelection(TextSelection.near(state.doc.resolve(selection.from)));
++  }
++  view.dispatch(tr);
++
++  // Firefox keeps a native range for each Ctrl+drag; keep only the one of
++  // the editor selection.
++  const domSelection = (view.root as Document).getSelection?.();
++  if (domSelection && domSelection.rangeCount > 1) {
++    domSelection.removeAllRanges();
++    try {
++      const start = view.domAtPos(view.state.selection.from);
++      const end = view.domAtPos(view.state.selection.to);
++      const range = view.dom.ownerDocument.createRange();
++      range.setStart(start.node, start.offset);
++      range.setEnd(end.node, end.offset);
++      domSelection.addRange(range);
++    } catch (_err) {
++      // ProseMirror sets the native selection again on the next update.
++    }
++  }
++}
++
++/**
++ * Picks several separate parts of a document: hold Ctrl (Cmd on Mac) and
++ * select text with the mouse, or Ctrl+click a paragraph to pick all of it.
++ * Ctrl+click on a picked part removes it, Escape or a click without Ctrl
++ * drops the parts. Formatting (bold, color, font, highlight, alignment,
++ * direction, headings, lists, numbering) is then applied to all parts at once
++ * by the editor commands (see ExtensionManager and lib/multiSelection).
++ */
++export default class MultiSelection extends Extension {
++  get name() {
++    return "multi_selection";
++  }
++
++  /**
++   * Runs an editor command on all parts when other parts are picked.
++   *
++   * @param name the command name.
++   * @returns the key handler.
++   */
++  private runCommand(name: string): Command {
++    return (state) => {
++      if (!getExtraRanges(state).length) {
++        return false;
++      }
++      const command = this.editor?.commands?.[name];
++      if (!command) {
++        return false;
++      }
++      command();
++      return true;
++    };
++  }
++
++  keys(): Record<string, Command> {
++    return {
++      "Mod-b": this.runCommand("strong"),
++      "Mod-B": this.runCommand("strong"),
++      "Mod-i": this.runCommand("em"),
++      "Mod-I": this.runCommand("em"),
++      "Mod-u": this.runCommand("underline"),
++      "Mod-d": this.runCommand("strikethrough"),
++      "Mod-e": this.runCommand("code_inline"),
++      "Mod-Shift-h": this.runCommand("highlight"),
++      "Shift-Ctrl-9": this.runCommand("ordered_list"),
++      "Shift-Ctrl-8": this.runCommand("bullet_list"),
++      "Shift-Ctrl-7": this.runCommand("checkbox_list"),
++    };
++  }
++
++  get plugins() {
++    return [
++      new Plugin<MultiSelectionState>({
++        key: multiSelectionKey,
++        state: {
++          init: () => EMPTY,
++          apply: (tr, value) => {
++            const meta = tr.getMeta(multiSelectionKey) as
++              | MultiSelectionMeta
++              | undefined;
++            if (meta) {
++              return {
++                ranges: meta.ranges
++                  ? normalizeRanges(meta.ranges)
++                  : mapRanges(value.ranges, tr),
++                gesture: meta.gesture ?? value.gesture,
++                held: meta.held ?? value.held,
++              };
++            }
++            if (!value.ranges.length) {
++              return value;
++            }
++            // Remote changes, changes made by plugins and selections made
++            // with the mouse and Ctrl/Cmd (also the ones the browser reports
++            // late, e.g. after a triple click) keep the parts; any other
++            // selection change drops them. "gesture" stays on until the next
++            // click without Ctrl/Cmd or a key.
++            if (tr.getMeta(Y_SYNC_META) || value.gesture || !tr.selectionSet) {
++              return tr.docChanged
++                ? { ...value, ranges: mapRanges(value.ranges, tr) }
++                : value;
++            }
++            return { ...EMPTY, held: value.held };
++          },
++        },
++        props: {
++          decorations: (state) => {
++            const ranges = getExtraRanges(state);
++            if (!ranges.length) {
++              return null;
++            }
++            return DecorationSet.create(
++              state.doc,
++              ranges.map((r) =>
++                Decoration.inline(r.from, r.to, { class: "multi-selection" })
++              )
++            );
++          },
++          handleKeyDown: (view, event) => {
++            if (!getExtraRanges(view.state).length) {
++              return false;
++            }
++            if (event.key === "Escape") {
++              setRanges(view, { ranges: [], gesture: false });
++              return true;
++            }
++            if (MOVE_KEYS.has(event.key)) {
++              setRanges(view, { gesture: false });
++            }
++            if (
++              !event.ctrlKey &&
++              !event.metaKey &&
++              !event.altKey &&
++              (event.key.length === 1 || EDIT_KEYS.has(event.key))
++            ) {
++              setRanges(view, { ranges: [], gesture: false });
++            }
++            return false;
++          },
++          handleDOMEvents: {
++            mousedown: (view, event) => {
++              if (!view.editable || event.button !== 0) {
++                return false;
++              }
++              if (!isModKey(event)) {
++                if (multiSelectionKey.getState(view.state)?.gesture) {
++                  setRanges(view, { gesture: false });
++                }
++                return false;
++              }
++              // The 2nd and 3rd click of a double or triple click go on with
++              // the parts from before the 1st one: what the 1st click picked
++              // is the selection that is being grown.
++              const clicks = Math.min(Math.max(event.detail || 1, 1), 3);
++              const series = clickSeries.get(view);
++              let ranges: SelectedRange[];
++              if (clicks > 1 && series && !deselectSeries.has(view)) {
++                ranges = series;
++              } else {
++                const current = rangeOfSelection(view.state.selection);
++                const extras = getExtraRanges(view.state);
++                ranges = current ? [...extras, current] : extras;
++                clickSeries.set(view, ranges);
++              }
++              setRanges(view, { ranges, gesture: true, held: true });
++              holdUntilRelease(view);
++              // Firefox adds the new drag to the native selection as another
++              // range, which ProseMirror would join with the old one into a
++              // selection over all the text in between. The picked parts are
++              // kept by this plugin, so the native selection is emptied and
++              // the drag starts a selection of its own.
++              const domSelection = (view.root as Document).getSelection?.();
++              if (domSelection && domSelection.rangeCount > 0) {
++                domSelection.removeAllRanges();
++              }
++              const ownerWindow = view.dom.ownerDocument.defaultView ?? window;
++              ownerWindow.addEventListener(
++                "mouseup",
++                () => ownerWindow.setTimeout(() => endGesture(view, clicks), 0),
++                { once: true }
++              );
++              return false;
++            },
++          },
++        },
++      }),
++    ];
++  }
++}
+diff --git a/shared/editor/lib/ExtensionManager.ts b/shared/editor/lib/ExtensionManager.ts
+index 7e776a7..bcd832d 100644
+--- a/shared/editor/lib/ExtensionManager.ts
++++ b/shared/editor/lib/ExtensionManager.ts
+@@ -13,6 +13,12 @@ import type { CommandFactory, WidgetProps } from "./Extension";
+ import type Extension from "./Extension";
+ import type { AnyExtension, AnyExtensionClass } from "./types";
+ import makeRules from "./markdown/rules";
++import {
++  getExtraRanges,
++  isMultiCommand,
++  multiSelectionKey,
++  runMultiCommand,
++} from "./multiSelection";
+ import { MarkdownSerializer } from "./markdown/serializer";
+ 
+ export default class ExtensionManager {
+@@ -270,12 +276,25 @@ export default class ExtensionManager {
+         }
+ 
+         const apply = (
++          commandName: string,
+           callback: CommandFactory,
+           attrs: Record<string, Primitive>
+         ) => {
+           if (!view.editable && !extension.allowInReadOnly) {
+             return;
+           }
++          // Parts picked with Ctrl/Cmd (MultiSelection): read them before
++          // focusing, which may reset the selection and drop them.
++          const extras = getExtraRanges(view.state);
++          const multi = extras.length > 0 && isMultiCommand(commandName);
++          const before = { doc: view.state.doc, selection: view.state.selection };
++          if (extras.length && !multi) {
++            view.dispatch(
++              view.state.tr
++                .setMeta(multiSelectionKey, { ranges: [], gesture: false })
++                .setMeta("addToHistory", false)
++            );
++          }
+           if (extension.focusAfterExecution) {
+             // Focusing a blurred editor (e.g. when the command is run from a
+             // menu that holds focus) can collapse a non-text selection such as
+@@ -292,6 +311,20 @@ export default class ExtensionManager {
+               );
+             }
+           }
++          if (
++            multi &&
++            view.state.doc === before.doc &&
++            runMultiCommand(
++              view,
++              commandName,
++              callback(attrs),
++              attrs,
++              before.selection,
++              extras
++            )
++          ) {
++            return true;
++          }
+           return callback(attrs)?.(view.state, view.dispatch, view);
+         };
+ 
+@@ -302,7 +335,7 @@ export default class ExtensionManager {
+ 
+           // @ts-expect-error FIXME
+           commands[_name] = (attrs: Record<string, Primitive>) =>
+-            values.forEach((callback) => apply(callback, attrs));
++            values.forEach((callback) => apply(_name, callback, attrs));
+         };
+ 
+         if (typeof value === "object") {
+diff --git a/shared/editor/lib/multiSelection.test.ts b/shared/editor/lib/multiSelection.test.ts
+new file mode 100644
+index 0000000..061f873
+--- /dev/null
++++ b/shared/editor/lib/multiSelection.test.ts
+@@ -0,0 +1,126 @@
++// VERSION: 1.0 (2026-10-15) patch 0017-multi-selection
++import type { Node } from "prosemirror-model";
++import { EditorState } from "prosemirror-state";
++import { doc, p, schema } from "@shared/test/editor";
++import {
++  normalizeRanges,
++  numberRanges,
++  toggleMarkOnRanges,
++} from "./multiSelection";
++
++const { ordered_list, list_item } = schema.nodes;
++
++/** Creates a numbered list with one paragraph per item. */
++function ol(items: string[], order = 1) {
++  return ordered_list.create(
++    { order },
++    items.map((text) => list_item.create(null, p(text)))
++  );
++}
++
++/** Returns the part covering the first text node with the given text. */
++function rangeOf(node: Node, text: string) {
++  let from = -1;
++  node.descendants((child, pos) => {
++    if (from === -1 && child.isText && child.text === text) {
++      from = pos;
++    }
++    return from === -1;
++  });
++  if (from === -1) {
++    throw new Error(`Text "${text}" not found`);
++  }
++  return { from, to: from + text.length };
++}
++
++/** Describes the top-level blocks, e.g. "OL1[a,b] | x". */
++function describe_(node: Node) {
++  const parts: string[] = [];
++  node.forEach((child) => {
++    if (child.type === ordered_list) {
++      const items: string[] = [];
++      child.forEach((item) => items.push(item.textContent));
++      parts.push(`OL${child.attrs.order}[${items.join(",")}]`);
++    } else {
++      parts.push(child.textContent);
++    }
++  });
++  return parts.join(" | ");
++}
++
++describe("normalizeRanges", () => {
++  it("sorts, merges overlapping parts and drops empty ones", () => {
++    expect(
++      normalizeRanges([
++        { from: 10, to: 12 },
++        { from: 1, to: 4 },
++        { from: 3, to: 6 },
++        { from: 8, to: 8 },
++      ])
++    ).toEqual([
++      { from: 1, to: 6 },
++      { from: 10, to: 12 },
++    ]);
++  });
++});
++
++describe("numberRanges", () => {
++  it("continues after a picked numbered item", () => {
++    const testDoc = doc([ol(["one", "two", "three"]), p("A"), p("x"), p("B")]);
++    const state = EditorState.create({ doc: testDoc });
++    const tr = numberRanges(state, [
++      rangeOf(testDoc, "three"),
++      rangeOf(testDoc, "A"),
++      rangeOf(testDoc, "B"),
++    ]);
++    expect(describe_(tr!.doc)).toBe("OL1[one,two,three,A] | x | OL5[B]");
++  });
++
++  it("numbers separate paragraphs as one sequence", () => {
++    const testDoc = doc([p("A"), p("x"), p("B"), p("y"), p("C")]);
++    const state = EditorState.create({ doc: testDoc });
++    const tr = numberRanges(state, [
++      rangeOf(testDoc, "A"),
++      rangeOf(testDoc, "B"),
++      rangeOf(testDoc, "C"),
++    ]);
++    expect(describe_(tr!.doc)).toBe("OL1[A] | x | OL2[B] | y | OL3[C]");
++  });
++
++  it("removes the numbering when all parts are numbered", () => {
++    const testDoc = doc([ol(["A"]), p("x"), ol(["B"], 2)]);
++    const state = EditorState.create({ doc: testDoc });
++    const tr = numberRanges(state, [
++      rangeOf(testDoc, "A"),
++      rangeOf(testDoc, "B"),
++    ]);
++    expect(describe_(tr!.doc)).toBe("A | x | B");
++  });
++});
++
++describe("toggleMarkOnRanges", () => {
++  it("adds a mark to all parts, then removes it from all", () => {
++    const testDoc = doc([p("hello"), p("x"), p("world")]);
++    const ranges = [rangeOf(testDoc, "hello"), rangeOf(testDoc, "world")];
++    const strong = schema.marks.strong;
++
++    const added = toggleMarkOnRanges(
++      EditorState.create({ doc: testDoc }),
++      strong,
++      undefined,
++      ranges
++    ).doc;
++    expect(added.rangeHasMark(ranges[0].from, ranges[0].to, strong)).toBe(true);
++    expect(added.rangeHasMark(ranges[1].from, ranges[1].to, strong)).toBe(true);
++
++    const removed = toggleMarkOnRanges(
++      EditorState.create({ doc: added }),
++      strong,
++      undefined,
++      ranges
++    ).doc;
++    expect(removed.rangeHasMark(ranges[0].from, ranges[1].to, strong)).toBe(
++      false
++    );
++  });
++});
+diff --git a/shared/editor/lib/multiSelection.ts b/shared/editor/lib/multiSelection.ts
+new file mode 100644
+index 0000000..3d02483
+--- /dev/null
++++ b/shared/editor/lib/multiSelection.ts
+@@ -0,0 +1,525 @@
++// VERSION: 1.1 (2026-10-15) patch 0017-multi-selection
++import type {
++  Attrs,
++  MarkType,
++  Node as ProsemirrorNode,
++  NodeType,
++} from "prosemirror-model";
++import type { Command, Selection, Transaction } from "prosemirror-state";
++import {
++  EditorState,
++  NodeSelection,
++  PluginKey,
++  TextSelection,
++} from "prosemirror-state";
++import { canJoin } from "prosemirror-transform";
++import type { EditorView } from "prosemirror-view";
++import toggleList from "../commands/toggleList";
++
++/** A part of the document picked with Ctrl (Cmd on Mac) held. */
++export type SelectedRange = { from: number; to: number };
++
++/** State of the multi-selection plugin. */
++export type MultiSelectionState = {
++  /** The other picked parts, besides the editor selection, in document order. */
++  ranges: SelectedRange[];
++  /** Whether a Ctrl/Cmd mouse gesture is in progress. */
++  gesture: boolean;
++  /** Whether Ctrl/Cmd is still held after picking with the mouse. */
++  held: boolean;
++};
++
++/** Meta set on a transaction to change the multi-selection state. */
++export type MultiSelectionMeta = Partial<MultiSelectionState>;
++
++export const multiSelectionKey = new PluginKey<MultiSelectionState>(
++  "multiSelection"
++);
++
++/** Toggled marks: applied to, or removed from, every part at once. */
++const MARK_COMMANDS = new Set([
++  "strong",
++  "em",
++  "underline",
++  "strikethrough",
++  "code_inline",
++  "highlight",
++]);
++
++/** Commands on blocks: run once per block range, in document order. */
++const BLOCK_COMMANDS = new Set([
++  "heading",
++  "blockquote",
++  "bullet_list",
++  "checkbox_list",
++  "setTextDirection",
++  "setTextAlignment",
++  "setListStyle",
++]);
++
++/** Commands on text: run once per part. */
++const RANGE_COMMANDS = new Set(["setTextStyle"]);
++
++/** Numbering commands and the number style each one sets. */
++const NUMBER_COMMANDS: Record<string, string | undefined> = {
++  ordered_list: undefined,
++  toggleLowerLetterList: "lower-alpha",
++  toggleUpperLetterList: "upper-alpha",
++};
++
++/**
++ * Whether a command is applied to every picked part.
++ *
++ * @param name the command name.
++ * @returns true when the command works on all parts.
++ */
++export function isMultiCommand(name: string): boolean {
++  return (
++    MARK_COMMANDS.has(name) ||
++    BLOCK_COMMANDS.has(name) ||
++    RANGE_COMMANDS.has(name) ||
++    name in NUMBER_COMMANDS
++  );
++}
++
++/**
++ * Returns the other picked parts of the document, besides the selection.
++ *
++ * @param state the editor state.
++ * @returns the parts, empty when nothing else is picked.
++ */
++export function getExtraRanges(state: EditorState): SelectedRange[] {
++  return multiSelectionKey.getState(state)?.ranges ?? [];
++}
++
++/**
++ * Whether parts are being picked: Ctrl/Cmd is held after a Ctrl/Cmd click.
++ * The formatting toolbar waits until it is released.
++ *
++ * @param state the editor state.
++ * @returns true while picking.
++ */
++export function isPicking(state: EditorState): boolean {
++  return multiSelectionKey.getState(state)?.held ?? false;
++}
++
++/**
++ * Sorts parts, joins the ones that overlap or touch and drops empty ones.
++ *
++ * @param ranges the parts.
++ * @returns the parts in document order.
++ */
++export function normalizeRanges(ranges: SelectedRange[]): SelectedRange[] {
++  const sorted = ranges
++    .filter((r) => r.to > r.from)
++    .map((r) => ({ from: r.from, to: r.to }))
++    .sort((a, b) => a.from - b.from);
++  const result: SelectedRange[] = [];
++  for (const range of sorted) {
++    const last = result[result.length - 1];
++    if (last && range.from <= last.to) {
++      last.to = Math.max(last.to, range.to);
++    } else {
++      result.push(range);
++    }
++  }
++  return result;
++}
++
++/**
++ * Maps parts through the changes of a transaction.
++ *
++ * @param ranges the parts.
++ * @param tr the transaction.
++ * @returns the mapped parts.
++ */
++export function mapRanges(
++  ranges: SelectedRange[],
++  tr: Transaction
++): SelectedRange[] {
++  return normalizeRanges(
++    ranges.map((r) => ({
++      from: tr.mapping.map(r.from, 1),
++      to: tr.mapping.map(r.to, -1),
++    }))
++  );
++}
++
++/**
++ * Returns the part covered by a selection: the text of a text selection, or
++ * the content of a selected text block (Ctrl+click selects the block).
++ *
++ * @param selection the selection.
++ * @returns the part, or null for an empty or other selection.
++ */
++export function rangeOfSelection(selection: Selection): SelectedRange | null {
++  if (selection instanceof TextSelection && !selection.empty) {
++    return { from: selection.from, to: selection.to };
++  }
++  if (selection instanceof NodeSelection && selection.node.isTextblock) {
++    const from = selection.from + 1;
++    const to = selection.to - 1;
++    return to > from ? { from, to } : null;
++  }
++  return null;
++}
++
++/**
++ * Builds a state that has the given part as its selection, to run a command
++ * on that part alone.
++ *
++ * @param doc the document.
++ * @param range the part.
++ * @returns the state.
++ */
++function stateFor(doc: ProsemirrorNode, range: SelectedRange): EditorState {
++  return EditorState.create({
++    doc,
++    selection: TextSelection.between(doc.resolve(range.from), doc.resolve(range.to)),
++  });
++}
++
++/**
++ * Runs a command on a state and adds its steps to a transaction.
++ *
++ * @param tr the transaction that collects the steps.
++ * @param command the command.
++ * @param range the part to select before running the command.
++ * @param view the editor view, passed on to the command.
++ * @returns whether the command changed anything.
++ */
++function runInto(
++  tr: Transaction,
++  command: Command,
++  range: SelectedRange,
++  view?: EditorView
++): boolean {
++  if (range.to < range.from) {
++    return false;
++  }
++  let changed = false;
++  command(
++    stateFor(tr.doc, range),
++    (t) => {
++      t.steps.forEach((step) => {
++        if (!tr.maybeStep(step).failed) {
++          changed = true;
++        }
++      });
++    },
++    view
++  );
++  return changed;
++}
++
++/**
++ * Runs a command on every part, one after the other, in a single transaction.
++ *
++ * @param state the editor state.
++ * @param command the command.
++ * @param ranges the parts, in document order.
++ * @param view the editor view, passed on to the command.
++ * @returns the transaction, or null when nothing changed.
++ */
++export function runOnRanges(
++  state: EditorState,
++  command: Command,
++  ranges: SelectedRange[],
++  view?: EditorView
++): Transaction | null {
++  const tr = state.tr;
++  let changed = false;
++  for (const range of ranges) {
++    const mapped = {
++      from: tr.mapping.map(range.from, 1),
++      to: tr.mapping.map(range.to, -1),
++    };
++    if (runInto(tr, command, mapped, view)) {
++      changed = true;
++    }
++  }
++  return changed ? tr : null;
++}
++
++/**
++ * Keeps one part per block range, so that a toggle is not run twice on the
++ * same block when two parts lie in it.
++ *
++ * @param doc the document.
++ * @param ranges the parts, in document order.
++ * @returns the parts, one per block range.
++ */
++export function dedupeBlocks(
++  doc: ProsemirrorNode,
++  ranges: SelectedRange[]
++): SelectedRange[] {
++  const seen = new Set<string>();
++  return ranges.filter((range) => {
++    const blockRange = doc
++      .resolve(range.from)
++      .blockRange(doc.resolve(range.to));
++    const key = blockRange
++      ? `${blockRange.start}:${blockRange.end}`
++      : `${range.from}:${range.to}`;
++    if (seen.has(key)) {
++      return false;
++    }
++    seen.add(key);
++    return true;
++  });
++}
++
++/**
++ * Whether all text of a part has a mark, with the given attributes if any.
++ *
++ * @param doc the document.
++ * @param range the part.
++ * @param type the mark type.
++ * @param attrs the attributes the mark must have.
++ * @returns true when every text node in the part has the mark.
++ */
++function rangeHasMark(
++  doc: ProsemirrorNode,
++  range: SelectedRange,
++  type: MarkType,
++  attrs?: Attrs | null
++): boolean {
++  let text = false;
++  let all = true;
++  doc.nodesBetween(range.from, range.to, (node, _pos, parent) => {
++    if (!all || !node.isText || !parent?.type.allowsMarkType(type)) {
++      return all;
++    }
++    text = true;
++    const mark = type.isInSet(node.marks);
++    if (
++      !mark ||
++      (attrs &&
++        Object.keys(attrs).some((key) => mark.attrs[key] !== attrs[key]))
++    ) {
++      all = false;
++    }
++    return all;
++  });
++  return text && all;
++}
++
++/**
++ * Toggles a mark on every part: when all parts have it, it is removed from
++ * all, otherwise it is set on all (replacing one with other attributes).
++ *
++ * @param state the editor state.
++ * @param type the mark type.
++ * @param attrs the attributes of the mark, e.g. a highlight color.
++ * @param ranges the parts.
++ * @returns the transaction.
++ */
++export function toggleMarkOnRanges(
++  state: EditorState,
++  type: MarkType,
++  attrs: Attrs | null | undefined,
++  ranges: SelectedRange[]
++): Transaction {
++  const remove = ranges.every((range) =>
++    rangeHasMark(state.doc, range, type, attrs)
++  );
++  const tr = state.tr;
++  for (const { from, to } of ranges) {
++    tr.removeMark(from, to, type);
++    if (!remove) {
++      tr.addMark(from, to, type.create(attrs ?? undefined));
++    }
++  }
++  return tr;
++}
++
++/**
++ * Finds the innermost list of a type around a position.
++ *
++ * @param doc the document.
++ * @param pos the position.
++ * @param type the list type.
++ * @returns the list and its position, or null.
++ */
++function findListAt(
++  doc: ProsemirrorNode,
++  pos: number,
++  type: NodeType
++): { pos: number; node: ProsemirrorNode } | null {
++  const $pos = doc.resolve(pos);
++  for (let depth = $pos.depth; depth > 0; depth--) {
++    const node = $pos.node(depth);
++    if (node.type === type) {
++      return { pos: $pos.before(depth), node };
++    }
++  }
++  return null;
++}
++
++/**
++ * Numbers every part as one continuous list, in document order. A part in a
++ * numbered list keeps that list, and the numbers go on after its last item;
++ * other parts are made numbered lists that start where the previous part
++ * ended (the first one at 1). So with item 3 of a list and two more
++ * paragraphs picked, the paragraphs get 4 and 5. A new list right after one
++ * that ends with the number before it is joined to it. When all parts are
++ * already numbered, the numbering is removed from them.
++ *
++ * @param state the editor state.
++ * @param ranges the parts, in document order.
++ * @param listStyle the number style, e.g. "lower-alpha", or undefined.
++ * @param view the editor view.
++ * @returns the transaction, or null when nothing changed.
++ */
++export function numberRanges(
++  state: EditorState,
++  ranges: SelectedRange[],
++  listStyle?: string,
++  view?: EditorView
++): Transaction | null {
++  const { schema } = state;
++  const listType = schema.nodes.ordered_list;
++  const itemType = schema.nodes.list_item;
++
++  type Unit =
++    | { kind: "list"; pos: number; range: SelectedRange }
++    | { kind: "blocks"; range: SelectedRange };
++  const units: Unit[] = [];
++  const lists = new Set<number>();
++  for (const range of dedupeBlocks(state.doc, ranges)) {
++    const list = findListAt(state.doc, range.from, listType);
++    if (list && range.to <= list.pos + list.node.nodeSize) {
++      if (!lists.has(list.pos)) {
++        lists.add(list.pos);
++        units.push({ kind: "list", pos: list.pos, range });
++      }
++    } else {
++      units.push({ kind: "blocks", range });
++    }
++  }
++
++  if (units.every((unit) => unit.kind === "list")) {
++    return runOnRanges(
++      state,
++      toggleList(listType, itemType, listStyle),
++      ranges,
++      view
++    );
++  }
++
++  const tr = state.tr;
++  let counter: number | null = null;
++  let style: string | null = listStyle ?? null;
++
++  for (const unit of units) {
++    let pos: number;
++    if (unit.kind === "list") {
++      pos = tr.mapping.map(unit.pos, 1);
++    } else {
++      const from = tr.mapping.map(unit.range.from, 1);
++      const to = tr.mapping.map(unit.range.to, -1);
++      runInto(
++        tr,
++        toggleList(listType, itemType, listStyle),
++        { from, to },
++        view
++      );
++      const list = findListAt(tr.doc, tr.mapping.map(unit.range.from, 1), listType);
++      if (!list) {
++        continue;
++      }
++      pos = list.pos;
++    }
++
++    const node = tr.doc.nodeAt(pos);
++    if (!node || node.type !== listType) {
++      continue;
++    }
++    const order: number = counter ?? node.attrs.order;
++    style = style ?? node.attrs.listStyle;
++    if (node.attrs.order !== order || node.attrs.listStyle !== style) {
++      tr.setNodeMarkup(pos, undefined, {
++        ...node.attrs,
++        order,
++        listStyle: style,
++      });
++    }
++    counter = order + node.childCount;
++
++    // A list right after one that ends with the number before it is joined.
++    const before = tr.doc.resolve(pos).nodeBefore;
++    if (
++      before?.type === listType &&
++      before.attrs.listStyle === style &&
++      before.attrs.order + before.childCount === order &&
++      canJoin(tr.doc, pos)
++    ) {
++      tr.join(pos);
++    }
++  }
++
++  return tr.docChanged ? tr : null;
++}
++
++/**
++ * Runs a command on the selection and on every other picked part, as one
++ * change (one undo step). The selection and the parts stay picked.
++ *
++ * @param view the editor view.
++ * @param name the command name.
++ * @param command the command for the selection.
++ * @param attrs the command attributes.
++ * @param main the selection when the command was started.
++ * @param extras the other parts when the command was started.
++ * @returns true when the command was run on the parts.
++ */
++export function runMultiCommand(
++  view: EditorView,
++  name: string,
++  command: Command | undefined,
++  attrs: Attrs | null | undefined,
++  main: Selection,
++  extras: SelectedRange[]
++): boolean {
++  const { state } = view;
++  const mainRange = rangeOfSelection(main);
++  const ranges = normalizeRanges(mainRange ? [...extras, mainRange] : extras);
++  if (!ranges.length) {
++    return false;
++  }
++
++  let tr: Transaction | null = null;
++  const markType = MARK_COMMANDS.has(name) ? state.schema.marks[name] : null;
++  if (markType) {
++    tr = toggleMarkOnRanges(state, markType, attrs, ranges);
++  } else if (name in NUMBER_COMMANDS) {
++    tr = numberRanges(state, ranges, NUMBER_COMMANDS[name], view);
++  } else if (command && BLOCK_COMMANDS.has(name)) {
++    tr = runOnRanges(state, command, dedupeBlocks(state.doc, ranges), view);
++  } else if (command && RANGE_COMMANDS.has(name)) {
++    tr = runOnRanges(state, command, ranges, view);
++  }
++  if (!tr) {
++    return true;
++  }
++
++  const result = tr;
++  const map = (r: SelectedRange) => ({
++    from: result.mapping.map(r.from, 1),
++    to: result.mapping.map(r.to, -1),
++  });
++  if (mainRange) {
++    const { from, to } = map(mainRange);
++    if (to > from) {
++      tr.setSelection(
++        TextSelection.between(tr.doc.resolve(from), tr.doc.resolve(to))
++      );
++    }
++  }
++  tr.setMeta(multiSelectionKey, {
++    ranges: normalizeRanges(extras.map(map)),
++    gesture: false,
++  } satisfies MultiSelectionMeta);
++  view.dispatch(tr);
++  return true;
++}
+diff --git a/shared/editor/nodes/index.ts b/shared/editor/nodes/index.ts
+index 5d396a1..eabb7d8 100644
+--- a/shared/editor/nodes/index.ts
++++ b/shared/editor/nodes/index.ts
+@@ -6,6 +6,7 @@ import History from "../extensions/History";
+ import InputRuleUndo from "../extensions/InputRuleUndo";
+ import ListDirection from "../extensions/ListDirection";
+ import MaxLength from "../extensions/MaxLength";
++import MultiSelection from "../extensions/MultiSelection";
+ import CodeDirection from "../extensions/CodeDirection";
+ import TextAlignment from "../extensions/TextAlignment";
+ import TextDirection from "../extensions/TextDirection";
+@@ -62,6 +63,8 @@ type Nodes = AnyExtensionClass[];
+ export const inlineExtensions: Nodes = [
+   Doc,
+   InputRuleUndo,
++  // Before the marks and lists, so that its keys and mouse handling come first.
++  MultiSelection,
+   Paragraph,
+   Emoji,
+   Text,

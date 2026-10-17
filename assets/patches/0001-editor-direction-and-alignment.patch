@@ -1,0 +1,1505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 01/18] feat(editor): text direction, RTL segments in code, text alignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0
+
+Text direction (was 0001 v1.1):
+- Paragraph and heading nodes get a dir attribute (rtl, ltr, or null for
+  the automatic detection), stored in the document JSON.
+- Formatting toolbar: Text direction submenu (RTL, LTR, automatic).
+- The direction is kept when switching between paragraph and heading, and
+  carried to the new block created by Enter.
+- Markdown: an explicit direction is written as a leading RLM/LRM and read
+  back into the dir attribute on import; tokens without text are skipped.
+- Blockquotes whose first paragraph is RTL are laid out right-to-left.
+
+Right-to-left segments in code (was 0002 v1.0):
+- Inline code and code blocks are always LTR and isolated (unicode-bidi:
+  isolate), so code no longer reorders surrounding RTL text.
+- Toolbar inside code: wrap the selection in RLE (U+202B) or LRE (U+202A)
+  ... PDF (U+202C); applying again removes or switches it. With a bare
+  cursor in a code block an empty RTL embedding is inserted.
+- Bidi control characters inside code are labelled (RLE, PDF, RLI, ...)
+  while editing; their effect on the layout is kept.
+
+Text alignment (was 0003 v1.0):
+- Paragraph and heading nodes get an align attribute (left, center, right,
+  justify, or null for the default), independent of the text direction.
+- Formatting toolbar: Text alignment submenu.
+- Alignment and direction are kept when switching block types and carried
+  to the new block created by Enter (shared helper carryBlockAttr).
+
+Files (21; N = new, M = modified, D = deleted):
+  N app/components/Icons/TextAlignIcon.tsx
+  N app/components/Icons/TextDirectionIcon.tsx
+  M app/editor/menus/code.tsx
+  M app/editor/menus/formatting.tsx
+  M shared/editor/commands/toggleBlockType.ts
+  M shared/editor/components/Styles.ts
+  N shared/editor/extensions/CodeDirection.ts
+  N shared/editor/extensions/TextAlignment.ts
+  N shared/editor/extensions/TextDirection.ts
+  N shared/editor/lib/carryBlockAttr.ts
+  M shared/editor/nodes/Heading.ts
+  M shared/editor/nodes/Paragraph.ts
+  M shared/editor/nodes/index.ts
+  N shared/editor/queries/getTextAlignment.test.ts
+  N shared/editor/queries/getTextAlignment.ts
+  N shared/editor/queries/getTextDirection.ts
+  N shared/editor/rules/textDirection.test.ts
+  N shared/editor/rules/textDirection.ts
+  M shared/editor/styles/EditorStyleHelper.ts
+  N shared/utils/bidi.test.ts
+  N shared/utils/bidi.ts
+
+---
+---
+
+diff --git a/app/components/Icons/TextAlignIcon.tsx b/app/components/Icons/TextAlignIcon.tsx
+new file mode 100644
+index 0000000..e5dd025
+--- /dev/null
++++ b/app/components/Icons/TextAlignIcon.tsx
+@@ -0,0 +1,42 @@
++import type { TextAlign } from "@shared/editor/queries/getTextAlignment";
++
++type Props = {
++  /** The alignment shown by the icon. */
++  align: TextAlign;
++  /** The size of the icon, 24px is default to match standard icons. */
++  size?: number;
++  /** The color of the icon, defaults to the current text color. */
++  color?: string;
++};
++
++const paths: Record<TextAlign, string> = {
++  left: "M4 6h16M4 10h10M4 14h16M4 18h10",
++  center: "M4 6h16M7 10h10M4 14h16M7 18h10",
++  right: "M4 6h16M10 10h10M4 14h16M10 18h10",
++  justify: "M4 6h16M4 10h16M4 14h16M4 18h16",
++};
++
++/**
++ * An icon of four lines for left, centered, right or justified text.
++ */
++export default function TextAlignIcon({
++  align,
++  size = 24,
++  color = "currentColor",
++}: Props) {
++  return (
++    <svg
++      width={size}
++      height={size}
++      viewBox="0 0 24 24"
++      fill="none"
++      stroke={color}
++      strokeWidth="1.6"
++      strokeLinecap="round"
++      strokeLinejoin="round"
++      aria-hidden
++    >
++      <path d={paths[align]} />
++    </svg>
++  );
++}
+diff --git a/app/components/Icons/TextDirectionIcon.tsx b/app/components/Icons/TextDirectionIcon.tsx
+new file mode 100644
+index 0000000..cd04015
+--- /dev/null
++++ b/app/components/Icons/TextDirectionIcon.tsx
+@@ -0,0 +1,50 @@
++type Props = {
++  /** The direction shown by the icon; "auto" shows both arrows. */
++  dir: "rtl" | "ltr" | "auto";
++  /** Draws brackets instead of a paragraph mark, for an embedding in code. */
++  embedded?: boolean;
++  /** The size of the icon, 24px is default to match standard icons. */
++  size?: number;
++  /** The color of the icon, defaults to the current text color. */
++  color?: string;
++};
++
++/**
++ * An icon showing a paragraph mark with an arrow for the text direction.
++ */
++export default function TextDirectionIcon({
++  dir,
++  embedded,
++  size = 24,
++  color = "currentColor",
++}: Props) {
++  return (
++    <svg
++      width={size}
++      height={size}
++      viewBox="0 0 24 24"
++      fill="none"
++      stroke={color}
++      strokeWidth="1.6"
++      strokeLinecap="round"
++      strokeLinejoin="round"
++      aria-hidden
++    >
++      {embedded ? (
++        <>
++          <path d="M8 4H6v9h2" />
++          <path d="M16 4h2v9h-2" />
++          <path d="M10 6.5h4M10 10.5h4" />
++        </>
++      ) : (
++        <>
++          <path d="M10 4v10M14 4v10" />
++          <path d="M16 4h-6a3 3 0 0 0 0 6" />
++        </>
++      )}
++      <path d="M5 18h14" />
++      {dir !== "rtl" && <path d="M16.5 15.5 19 18l-2.5 2.5" />}
++      {dir !== "ltr" && <path d="M7.5 15.5 5 18l2.5 2.5" />}
++    </svg>
++  );
++}
+diff --git a/app/editor/menus/code.tsx b/app/editor/menus/code.tsx
+index 05ae234..c5ef7d6 100644
+--- a/app/editor/menus/code.tsx
++++ b/app/editor/menus/code.tsx
+@@ -14,6 +14,7 @@ import { isMermaid } from "@shared/editor/lib/isCode";
+ import { t } from "i18next";
+ import type { MenuItem, SelectionContext } from "@shared/editor/types";
+ import { metaDisplay } from "@shared/utils/keyboard";
++import TextDirectionIcon from "~/components/Icons/TextDirectionIcon";
+ 
+ /**
+  * Returns menu items for the code block selection toolbar.
+@@ -84,6 +85,15 @@ export default function codeMenuItems(ctx: SelectionContext): MenuItem[] {
+       active: () => node.attrs.wrap,
+       visible: !readOnly && (!isMermaid(node) || isEditingMermaid),
+     },
++    {
++      // Inserts an empty embedding (RLE … PDF) at the cursor for typing a
++      // right-to-left segment, such as a Persian comment.
++      name: "embedTextDirection",
++      icon: <TextDirectionIcon dir="rtl" embedded />,
++      tooltip: t("Right-to-left segment"),
++      attrs: { dir: "rtl" },
++      visible: !readOnly && ctx.isEmpty && !isMermaid(node),
++    },
+     {
+       name: "separator",
+     },
+diff --git a/app/editor/menus/formatting.tsx b/app/editor/menus/formatting.tsx
+index 8598458..9f314a6 100644
+--- a/app/editor/menus/formatting.tsx
++++ b/app/editor/menus/formatting.tsx
+@@ -52,6 +52,16 @@ import type { CellSelection } from "prosemirror-tables";
+ import TableCell from "@shared/editor/nodes/TableCell";
+ import Highlight from "@shared/editor/marks/Highlight";
+ import { DottedCircleIcon } from "~/components/Icons/DottedCircleIcon";
++import TextDirectionIcon from "~/components/Icons/TextDirectionIcon";
++import TextAlignIcon from "~/components/Icons/TextAlignIcon";
++import {
++  getTextAlignment,
++  isTextAlignActive,
++} from "@shared/editor/queries/getTextAlignment";
++import {
++  getTextDirection,
++  isTextDirectionActive,
++} from "@shared/editor/queries/getTextDirection";
+ 
+ /**
+  * Returns menu items for the default formatting selection toolbar.
+@@ -91,6 +101,8 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+ 
+   const selectedCellsColorSet = getColorSetForSelectedCells(state.selection);
+   const canFormat = !isInCodeBlock;
++  const textDirection = getTextDirection(state);
++  const textAlignment = getTextAlignment(state);
+ 
+   // The block controls come first, so they are the ones on screen with a bare
+   // cursor and the bar scrolls right to the text controls for a selection.
+@@ -234,6 +246,128 @@ export default function formattingMenuItems(ctx: SelectionContext): MenuItem[] {
+       name: "separator",
+       visible: !isInCodeBlock,
+     },
++    {
++      // Explicit text direction of the selected blocks.
++      group: MenuItemGroup.block,
++      tooltip: t("Text direction"),
++      icon: (
++        <TextDirectionIcon
++          dir={
++            textDirection === "rtl" || textDirection === "ltr"
++              ? textDirection
++              : "auto"
++          }
++        />
++      ),
++      active: () => textDirection !== null,
++      visible: !isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "setTextDirection",
++          label: t("Right to left"),
++          icon: <TextDirectionIcon dir="rtl" />,
++          active: isTextDirectionActive("rtl"),
++          attrs: { dir: "rtl" },
++        },
++        {
++          name: "setTextDirection",
++          label: t("Left to right"),
++          icon: <TextDirectionIcon dir="ltr" />,
++          active: isTextDirectionActive("ltr"),
++          attrs: { dir: "ltr" },
++        },
++        {
++          name: "setTextDirection",
++          label: t("Automatic direction"),
++          icon: <TextDirectionIcon dir="auto" />,
++          active: isTextDirectionActive(null),
++          attrs: { dir: null },
++        },
++      ],
++    },
++    {
++      // Explicit alignment of the selected blocks, independent of direction.
++      group: MenuItemGroup.block,
++      tooltip: t("Text alignment"),
++      icon: (
++        <TextAlignIcon
++          align={
++            textAlignment === null || textAlignment === "mixed"
++              ? "left"
++              : textAlignment
++          }
++        />
++      ),
++      active: () => textAlignment !== null,
++      visible: !isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "setTextAlignment",
++          label: t("Align left"),
++          icon: <TextAlignIcon align="left" />,
++          active: isTextAlignActive("left"),
++          attrs: { align: "left" },
++        },
++        {
++          name: "setTextAlignment",
++          label: t("Align center"),
++          icon: <TextAlignIcon align="center" />,
++          active: isTextAlignActive("center"),
++          attrs: { align: "center" },
++        },
++        {
++          name: "setTextAlignment",
++          label: t("Align right"),
++          icon: <TextAlignIcon align="right" />,
++          active: isTextAlignActive("right"),
++          attrs: { align: "right" },
++        },
++        {
++          name: "setTextAlignment",
++          label: t("Justify"),
++          icon: <TextAlignIcon align="justify" />,
++          active: isTextAlignActive("justify"),
++          attrs: { align: "justify" },
++        },
++        {
++          name: "setTextAlignment",
++          label: t("Default alignment"),
++          active: isTextAlignActive(null),
++          attrs: { align: null },
++        },
++      ],
++    },
++    {
++      name: "separator",
++      visible: !isInCode,
++    },
++    {
++      // Code stays left-to-right; a segment is wrapped in control characters.
++      group: MenuItemGroup.inline,
++      tooltip: t("Text direction"),
++      icon: <TextDirectionIcon dir="auto" embedded />,
++      visible: isInCode,
++      children: (): MenuItem[] => [
++        {
++          name: "embedTextDirection",
++          label: t("Right-to-left segment"),
++          tooltip: "U+202B … U+202C",
++          icon: <TextDirectionIcon dir="rtl" embedded />,
++          attrs: { dir: "rtl" },
++        },
++        {
++          name: "embedTextDirection",
++          label: t("Left-to-right segment"),
++          tooltip: "U+202A … U+202C",
++          icon: <TextDirectionIcon dir="ltr" embedded />,
++          attrs: { dir: "ltr" },
++        },
++      ],
++    },
++    {
++      name: "separator",
++      visible: isInCode,
++    },
+     {
+       name: "placeholder",
+       group: MenuItemGroup.inline,
+diff --git a/shared/editor/commands/toggleBlockType.ts b/shared/editor/commands/toggleBlockType.ts
+index a0259a9..a88699e 100644
+--- a/shared/editor/commands/toggleBlockType.ts
++++ b/shared/editor/commands/toggleBlockType.ts
+@@ -18,10 +18,24 @@ export default function toggleBlockType(
+   return (state, dispatch) => {
+     const isActive = isNodeActive(type, attrs)(state);
+ 
++    // Keep an explicit text direction and alignment when switching between
++    // block types, e.g. a right-to-left paragraph stays right-to-left as a
++    // heading.
++    const current = state.selection.$from.parent.attrs;
++    const withDir = (target: NodeType, base: Record<string, unknown>) => {
++      const result = { ...base };
++      for (const name of ["dir", "align"]) {
++        if (current[name] && target.spec.attrs && name in target.spec.attrs) {
++          result[name] = current[name];
++        }
++      }
++      return result;
++    };
++
+     if (isActive) {
+-      return setBlockType(toggleType)(state, dispatch);
++      return setBlockType(toggleType, withDir(toggleType, {}))(state, dispatch);
+     }
+ 
+-    return setBlockType(type, attrs)(state, dispatch);
++    return setBlockType(type, withDir(type, attrs))(state, dispatch);
+   };
+ }
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index cd607ae..d03584f 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -1414,10 +1414,17 @@ blockquote {
+     background: ${props.theme.quote};
+   }
+ 
+-  &:dir(rtl)::before {
++  &:dir(rtl)::before,
++  &:has(> p[dir="rtl"]:first-child)::before {
+     margin-left: 0;
+     margin-right: -1.5em;
+   }
++
++  /* A quote whose first paragraph was set to right-to-left in the editor. */
++  &:has(> p[dir="rtl"]:first-child) {
++    direction: rtl;
++    padding: 8px 1.5em 8px 10px;
++  }
+ }
+ 
+ b,
+@@ -1741,6 +1748,11 @@ hr.ProseMirror-selectednode::before {
+ 
+ .math-inline .math-src .ProseMirror,
+ code {
++  /* Code is always left-to-right and isolated from the surrounding text, so
++     it neither reorders a right-to-left sentence nor is reordered by it.
++     Bidi control characters typed inside the code still take effect. */
++  direction: ltr;
++  unicode-bidi: isolate;
+   box-decoration-break: clone;
+   -webkit-box-decoration-break: clone;
+ 
+@@ -1763,6 +1775,52 @@ code {
+   }
+ }
+ 
++.${EditorStyleHelper.bidiControl} {
++  /* The character keeps its effect; only a label is added while editing. */
++  ${
++    props.readOnly
++      ? ""
++      : `&::after {
++    content: attr(data-bidi);
++    display: inline-block;
++    direction: ltr;
++    unicode-bidi: isolate;
++    margin: 0 1px;
++    padding: 0 2px;
++    border-radius: 2px;
++    font-family: ${props.theme.fontFamily};
++    font-size: 9px;
++    line-height: 12px;
++    vertical-align: super;
++    color: ${props.theme.textTertiary};
++    background: ${props.theme.codeBorder};
++    pointer-events: none;
++    user-select: none;
++  }`
++  }
++}
++
++/* Explicit alignment of text blocks, independent of the text direction. */
++p[data-align="left"],
++.heading-content[data-align="left"] {
++  text-align: left;
++}
++
++p[data-align="center"],
++.heading-content[data-align="center"] {
++  text-align: center;
++}
++
++p[data-align="right"],
++.heading-content[data-align="right"] {
++  text-align: right;
++}
++
++p[data-align="justify"],
++.heading-content[data-align="justify"] {
++  text-align: justify;
++}
++
+ mark {
+   border-radius: 1px;
+   padding: 2px 0;
+diff --git a/shared/editor/extensions/CodeDirection.ts b/shared/editor/extensions/CodeDirection.ts
+new file mode 100644
+index 0000000..cbceb87
+--- /dev/null
++++ b/shared/editor/extensions/CodeDirection.ts
+@@ -0,0 +1,142 @@
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import type { Command } from "prosemirror-state";
++import { Plugin, PluginKey, TextSelection } from "prosemirror-state";
++import { Decoration, DecorationSet } from "prosemirror-view";
++import type { TextDirection } from "../../utils/bidi";
++import {
++  BidiChar,
++  BidiCharLabel,
++  bidiControlRegex,
++  toggleEmbeddedDirection,
++} from "../../utils/bidi";
++import Extension from "../lib/Extension";
++import { isInCode } from "../queries/isInCode";
++import { EditorStyleHelper } from "../styles/EditorStyleHelper";
++import { dirFromAttrs } from "./TextDirection";
++
++const pluginKey = new PluginKey<DecorationSet>("codeDirection");
++
++/**
++ * Returns true if a text node is code: inside a code block or with a code mark.
++ *
++ * @param node the text node.
++ * @param parent the parent block.
++ * @returns true if the text is code.
++ */
++function isCodeText(node: ProsemirrorNode, parent: ProsemirrorNode | null) {
++  return !!parent?.type.spec.code || node.marks.some((m) => m.type.spec.code);
++}
++
++/**
++ * Builds decorations labelling each bidirectional control character in code.
++ * The characters themselves are untouched, so they keep their effect.
++ *
++ * @param doc the document.
++ * @returns the decorations.
++ */
++function buildDecorations(doc: ProsemirrorNode): DecorationSet {
++  const decorations: Decoration[] = [];
++
++  doc.descendants((node, pos, parent) => {
++    if (!node.isText || !node.text || !isCodeText(node, parent)) {
++      return;
++    }
++    for (const match of node.text.matchAll(bidiControlRegex)) {
++      const from = pos + (match.index ?? 0);
++      decorations.push(
++        Decoration.inline(from, from + 1, {
++          class: EditorStyleHelper.bidiControl,
++          "data-bidi": BidiCharLabel[match[0]] ?? "",
++        })
++      );
++    }
++  });
++
++  return DecorationSet.create(doc, decorations);
++}
++
++/**
++ * Code is always laid out left-to-right. To write a right-to-left segment
++ * inside code, such as a Persian comment or string, the selection is wrapped
++ * in Unicode embedding characters: RLE (U+202B) or LRE (U+202A) … PDF
++ * (U+202C). These characters are part of the text, so they also apply when
++ * the code is copied elsewhere, and they are labelled while editing.
++ */
++export default class CodeDirection extends Extension {
++  get name() {
++    return "code_direction";
++  }
++
++  get plugins() {
++    return [
++      new Plugin<DecorationSet>({
++        key: pluginKey,
++        state: {
++          init: (_, state) => buildDecorations(state.doc),
++          apply: (tr, value) =>
++            tr.docChanged ? buildDecorations(tr.doc) : value,
++        },
++        props: {
++          decorations: (state) => pluginKey.getState(state),
++        },
++      }),
++    ];
++  }
++
++  commands() {
++    return {
++      embedTextDirection: (attrs?: unknown) => {
++        const dir = dirFromAttrs(attrs);
++        return dir ? this.embedTextDirection(dir) : () => false;
++      },
++    };
++  }
++
++  /**
++   * Toggles a directional embedding around the selected code. With a bare
++   * cursor an empty embedding is inserted and the cursor placed inside it.
++   *
++   * @param dir the direction to embed.
++   * @returns the command.
++   */
++  private embedTextDirection(dir: TextDirection): Command {
++    return (state, dispatch) => {
++      if (!isInCode(state)) {
++        return false;
++      }
++
++      const { from, to, empty } = state.selection;
++
++      if (empty) {
++        const start = dir === "rtl" ? BidiChar.RLE : BidiChar.LRE;
++        const tr = state.tr.insertText(start + BidiChar.PDF, from);
++        tr.setSelection(TextSelection.create(tr.doc, from + 1));
++        dispatch?.(tr);
++        return true;
++      }
++
++      const replacement = toggleEmbeddedDirection(
++        state.doc.textBetween(from, to),
++        dir
++      );
++
++      if (!replacement) {
++        dispatch?.(state.tr.delete(from, to));
++        return true;
++      }
++
++      // Keep the marks of the selected text, e.g. inline code.
++      const marks = state.doc.nodeAt(from)?.marks ?? [];
++      const tr = state.tr.replaceWith(
++        from,
++        to,
++        state.schema.text(replacement, marks)
++      );
++      tr.setSelection(
++        TextSelection.create(tr.doc, from, from + replacement.length)
++      );
++      dispatch?.(tr);
++      return true;
++    };
++  }
++}
+diff --git a/shared/editor/extensions/TextAlignment.ts b/shared/editor/extensions/TextAlignment.ts
+new file mode 100644
+index 0000000..e377b88
+--- /dev/null
++++ b/shared/editor/extensions/TextAlignment.ts
+@@ -0,0 +1,76 @@
++import type { Command } from "prosemirror-state";
++import { Plugin } from "prosemirror-state";
++import Extension from "../lib/Extension";
++import { carryBlockAttr } from "../lib/carryBlockAttr";
++import type { TextAlign } from "../queries/getTextAlignment";
++import { toTextAlign } from "../queries/getTextAlignment";
++import {
++  directionalNodeNames,
++  forEachDirectionalBlock,
++} from "../queries/getTextDirection";
++import { isInCode } from "../queries/isInCode";
++
++/**
++ * An editor extension for the alignment of text blocks: left, center, right
++ * or justified. It is independent of the text direction, so a block can be
++ * both right-to-left and justified, or right-to-left and left-aligned.
++ */
++export default class TextAlignment extends Extension {
++  get name() {
++    return "text_alignment";
++  }
++
++  get plugins() {
++    return [
++      new Plugin({
++        // A new block created by Enter continues with the same alignment.
++        appendTransaction: (transactions, oldState, newState) =>
++          carryBlockAttr(
++            "align",
++            directionalNodeNames,
++            transactions,
++            oldState,
++            newState
++          ),
++      }),
++    ];
++  }
++
++  commands() {
++    return {
++      setTextAlignment: (attrs?: unknown) =>
++        this.setTextAlignment(
++          attrs && typeof attrs === "object" && "align" in attrs
++            ? toTextAlign(attrs.align)
++            : null
++        ),
++    };
++  }
++
++  /**
++   * Sets an explicit alignment on every text block in the selection.
++   *
++   * @param align the alignment, or null for the default.
++   * @returns the command.
++   */
++  private setTextAlignment(align: TextAlign | null): Command {
++    return (state, dispatch) => {
++      if (isInCode(state)) {
++        return false;
++      }
++
++      const tr = state.tr;
++      forEachDirectionalBlock(state, (node, pos) => {
++        if ((node.attrs.align ?? null) !== align) {
++          tr.setNodeMarkup(pos, undefined, { ...node.attrs, align });
++        }
++      });
++
++      if (!tr.docChanged) {
++        return false;
++      }
++      dispatch?.(tr);
++      return true;
++    };
++  }
++}
+diff --git a/shared/editor/extensions/TextDirection.ts b/shared/editor/extensions/TextDirection.ts
+new file mode 100644
+index 0000000..93cf061
+--- /dev/null
++++ b/shared/editor/extensions/TextDirection.ts
+@@ -0,0 +1,90 @@
++import type { PluginSimple } from "markdown-it";
++import type { Command } from "prosemirror-state";
++import { Plugin } from "prosemirror-state";
++import type { TextDirection as Direction } from "../../utils/bidi";
++import { toTextDirection } from "../../utils/bidi";
++import Extension from "../lib/Extension";
++import { carryBlockAttr } from "../lib/carryBlockAttr";
++import {
++  directionalNodeNames,
++  forEachDirectionalBlock,
++} from "../queries/getTextDirection";
++import { isInCode } from "../queries/isInCode";
++import textDirectionRule from "../rules/textDirection";
++
++/**
++ * Reads the direction from command attributes.
++ *
++ * @param attrs the attributes passed to the command, e.g. `{ dir: "rtl" }`.
++ * @returns the direction, or null for automatic.
++ */
++export function dirFromAttrs(attrs: unknown): Direction | null {
++  return attrs && typeof attrs === "object" && "dir" in attrs
++    ? toTextDirection(attrs.dir)
++    : null;
++}
++
++/**
++ * An editor extension for right-to-left and mixed-direction writing. Text
++ * blocks can be given an explicit direction, so that a Persian sentence that
++ * starts with a Latin word is still laid out right-to-left, instead of the
++ * direction being guessed from the first strong character of each line.
++ */
++export default class TextDirection extends Extension {
++  get name() {
++    return "text_direction";
++  }
++
++  get rulePlugins(): PluginSimple[] {
++    return [textDirectionRule];
++  }
++
++  get plugins() {
++    return [
++      new Plugin({
++        appendTransaction: (transactions, oldState, newState) =>
++          carryBlockAttr(
++            "dir",
++            directionalNodeNames,
++            transactions,
++            oldState,
++            newState
++          ),
++      }),
++    ];
++  }
++
++  commands() {
++    return {
++      setTextDirection: (attrs?: unknown) =>
++        this.setTextDirection(dirFromAttrs(attrs)),
++    };
++  }
++
++  /**
++   * Sets an explicit direction on every text block in the selection.
++   *
++   * @param dir the direction, or null for automatic detection.
++   * @returns the command.
++   */
++  private setTextDirection(dir: Direction | null): Command {
++    return (state, dispatch) => {
++      if (isInCode(state)) {
++        return false;
++      }
++
++      const tr = state.tr;
++      forEachDirectionalBlock(state, (node, pos) => {
++        if ((node.attrs.dir ?? null) !== dir) {
++          tr.setNodeMarkup(pos, undefined, { ...node.attrs, dir });
++        }
++      });
++
++      if (!tr.docChanged) {
++        return false;
++      }
++      dispatch?.(tr);
++      return true;
++    };
++  }
++}
+diff --git a/shared/editor/lib/carryBlockAttr.ts b/shared/editor/lib/carryBlockAttr.ts
+new file mode 100644
+index 0000000..7965162
+--- /dev/null
++++ b/shared/editor/lib/carryBlockAttr.ts
+@@ -0,0 +1,60 @@
++import type { EditorState, Transaction } from "prosemirror-state";
++
++/**
++ * Carries a block attribute, such as the text direction, from the block that
++ * held the cursor to a new empty block created by the transactions, e.g. when
++ * Enter is pressed at the end of a right-to-left paragraph. Meant to be called
++ * from a plugin's `appendTransaction`.
++ *
++ * @param attr the name of the attribute to carry.
++ * @param nodeNames the names of the nodes that carry the attribute.
++ * @param transactions the applied transactions.
++ * @param oldState the state before the transactions.
++ * @param newState the state after the transactions.
++ * @returns a transaction setting the attribute on the new block, or undefined.
++ */
++export function carryBlockAttr(
++  attr: string,
++  nodeNames: ReadonlySet<string>,
++  transactions: readonly Transaction[],
++  oldState: EditorState,
++  newState: EditorState
++): Transaction | undefined {
++  if (!transactions.some((tr) => tr.docChanged)) {
++    return undefined;
++  }
++
++  const $old = oldState.selection.$from;
++  const $new = newState.selection.$from;
++  const value = $old.parent.attrs[attr];
++  const block = $new.parent;
++
++  if (
++    !value ||
++    $old.depth === 0 ||
++    $new.depth === 0 ||
++    !newState.selection.empty ||
++    !nodeNames.has($old.parent.type.name) ||
++    !nodeNames.has(block.type.name) ||
++    block.content.size > 0 ||
++    block.attrs[attr]
++  ) {
++    return undefined;
++  }
++
++  // Only a new block: the block that held the cursor must not be the one that
++  // is now empty, e.g. after its attribute was cleared or its text deleted.
++  let mapped = $old.before();
++  for (const tr of transactions) {
++    mapped = tr.mapping.map(mapped);
++  }
++  const start = $new.before();
++  if (mapped === start) {
++    return undefined;
++  }
++
++  return newState.tr.setNodeMarkup(start, undefined, {
++    ...block.attrs,
++    [attr]: value,
++  });
++}
+diff --git a/shared/editor/nodes/Heading.ts b/shared/editor/nodes/Heading.ts
+index b7304c1..f507af4 100644
+--- a/shared/editor/nodes/Heading.ts
++++ b/shared/editor/nodes/Heading.ts
+@@ -17,6 +17,8 @@ import { removeUrlFragment, removeUrlPathSuffix } from "../../utils/urls";
+ import backspaceToParagraph from "../commands/backspaceToParagraph";
+ import toggleBlockType from "../commands/toggleBlockType";
+ import type { MarkdownSerializerState } from "../lib/markdown/serializer";
++import { BidiChar, toTextDirection } from "../../utils/bidi";
++import { toTextAlign } from "../queries/getTextAlignment";
+ import Node from "./Node";
+ import { EditorStyleHelper } from "../styles/EditorStyleHelper";
+ 
+@@ -80,6 +82,18 @@ export default class Heading extends Node<HeadingOptions> {
+         collapsed: {
+           default: undefined,
+         },
++        // An explicit direction ("rtl" or "ltr"), or null to detect it from
++        // the text as before.
++        dir: {
++          default: null,
++          validate: (value: unknown) =>
++            value === null || !!toTextDirection(value),
++        },
++        // "left", "center", "right" or "justify", or null for the default.
++        align: {
++          default: null,
++          validate: (value: unknown) => value === null || !!toTextAlign(value),
++        },
+       },
+       content: "inline*",
+       group: "block",
+@@ -87,15 +101,22 @@ export default class Heading extends Node<HeadingOptions> {
+       draggable: false,
+       parseDOM: this.options.levels.map((level: number) => ({
+         tag: `h${level}`,
+-        attrs: { level },
++        getAttrs: (dom: HTMLElement) => ({
++          level,
++          dir: toTextDirection(dom.getAttribute("dir")),
++          align: toTextAlign(
++            dom.getAttribute("data-align") || dom.style.textAlign
++          ),
++        }),
+       })),
+       toDOM: (node) => [
+         // A level outside of the range produces an invalid tag name, which
+         // would stop the document rendering.
+         `h${toLevel(node.attrs.level) + (this.options.offset || 0)}`,
+         {
+-          dir: "auto",
++          dir: node.attrs.dir ?? "auto",
+           class: "heading-content",
++          ...(node.attrs.align ? { "data-align": node.attrs.align } : {}),
+         },
+         0,
+       ],
+@@ -104,6 +125,11 @@ export default class Heading extends Node<HeadingOptions> {
+ 
+   toMarkdown(state: MarkdownSerializerState, node: ProsemirrorNode) {
+     state.write(state.repeat("#", toLevel(node.attrs.level)) + " ");
++    if (node.attrs.dir === "rtl") {
++      state.write(BidiChar.RLM);
++    } else if (node.attrs.dir === "ltr") {
++      state.write(BidiChar.LRM);
++    }
+     state.renderInline(node);
+     state.closeBlock(node);
+   }
+@@ -113,6 +139,7 @@ export default class Heading extends Node<HeadingOptions> {
+       block: "heading",
+       getAttrs: (token: Token) => ({
+         level: +token.tag.slice(1),
++        dir: toTextDirection(token.attrGet("dir")),
+       }),
+     };
+   }
+diff --git a/shared/editor/nodes/Paragraph.ts b/shared/editor/nodes/Paragraph.ts
+index 6b91cee..623f344 100644
+--- a/shared/editor/nodes/Paragraph.ts
++++ b/shared/editor/nodes/Paragraph.ts
+@@ -6,6 +6,9 @@ import type {
+ } from "prosemirror-model";
+ import deleteEmptyFirstParagraph from "../commands/deleteEmptyFirstParagraph";
+ import type { MarkdownSerializerState } from "../lib/markdown/serializer";
++import type Token from "markdown-it/lib/token.mjs";
++import { BidiChar, toTextDirection } from "../../utils/bidi";
++import { toTextAlign } from "../queries/getTextAlignment";
+ import Node from "./Node";
+ import { EditorStyleHelper } from "../styles/EditorStyleHelper";
+ 
+@@ -16,6 +19,20 @@ export default class Paragraph extends Node {
+ 
+   get schema(): NodeSpec {
+     return {
++      attrs: {
++        // An explicit direction ("rtl" or "ltr"), or null to detect it from
++        // the text as before.
++        dir: {
++          default: null,
++          validate: (value: unknown) =>
++            value === null || !!toTextDirection(value),
++        },
++        // "left", "center", "right" or "justify", or null for the default.
++        align: {
++          default: null,
++          validate: (value: unknown) => value === null || !!toTextAlign(value),
++        },
++      },
+       content: "inline*",
+       group: "block",
+       parseDOM: [
+@@ -31,11 +48,23 @@ export default class Paragraph extends Node {
+               return false;
+             }
+ 
+-            return {};
++            return {
++              dir: toTextDirection(dom.getAttribute("dir")),
++              align: toTextAlign(
++                dom.getAttribute("data-align") || dom.style.textAlign
++              ),
++            };
+           },
+         },
+       ],
+-      toDOM: () => ["p", { dir: "auto" }, 0],
++      toDOM: (node) => [
++        "p",
++        {
++          dir: node.attrs.dir ?? "auto",
++          ...(node.attrs.align ? { "data-align": node.attrs.align } : {}),
++        },
++        0,
++      ],
+     };
+   }
+ 
+@@ -60,12 +89,24 @@ export default class Paragraph extends Node {
+     ) {
+       state.write(state.options.commonMark ? "\n" : "\\\n");
+     } else {
++      // A direction mark keeps the explicit direction in Markdown, where it
++      // is invisible but still respected by most renderers.
++      if (node.attrs.dir === "rtl") {
++        state.write(BidiChar.RLM);
++      } else if (node.attrs.dir === "ltr") {
++        state.write(BidiChar.LRM);
++      }
+       state.renderInline(node);
+       state.closeBlock(node);
+     }
+   }
+ 
+   parseMarkdown() {
+-    return { block: "paragraph" };
++    return {
++      block: "paragraph",
++      getAttrs: (token: Token) => ({
++        dir: toTextDirection(token.attrGet("dir")),
++      }),
++    };
+   }
+ }
+diff --git a/shared/editor/nodes/index.ts b/shared/editor/nodes/index.ts
+index 55ccf6f..d5ef00e 100644
+--- a/shared/editor/nodes/index.ts
++++ b/shared/editor/nodes/index.ts
+@@ -5,6 +5,9 @@ import HeadingPrefix from "../extensions/HeadingPrefix";
+ import History from "../extensions/History";
+ import InputRuleUndo from "../extensions/InputRuleUndo";
+ import MaxLength from "../extensions/MaxLength";
++import CodeDirection from "../extensions/CodeDirection";
++import TextAlignment from "../extensions/TextAlignment";
++import TextDirection from "../extensions/TextDirection";
+ import TrailingNode from "../extensions/TrailingNode";
+ import type { AnyExtensionClass } from "../lib/types";
+ import Bold from "../marks/Bold";
+@@ -73,6 +76,9 @@ export const inlineExtensions: Nodes = [
+   HardBreak,
+   DeleteNearAtom,
+   ColorSwatchPreview,
++  TextDirection,
++  TextAlignment,
++  CodeDirection,
+ ];
+ 
+ export const listExtensions: Nodes = [
+diff --git a/shared/editor/queries/getTextAlignment.test.ts b/shared/editor/queries/getTextAlignment.test.ts
+new file mode 100644
+index 0000000..800b861
+--- /dev/null
++++ b/shared/editor/queries/getTextAlignment.test.ts
+@@ -0,0 +1,17 @@
++import { toTextAlign } from "./getTextAlignment";
++
++describe("toTextAlign", () => {
++  it("accepts left, center, right and justify", () => {
++    expect(toTextAlign("left")).toBe("left");
++    expect(toTextAlign("center")).toBe("center");
++    expect(toTextAlign("right")).toBe("right");
++    expect(toTextAlign("justify")).toBe("justify");
++  });
++
++  it("rejects anything else", () => {
++    expect(toTextAlign("start")).toBeNull();
++    expect(toTextAlign("")).toBeNull();
++    expect(toTextAlign(null)).toBeNull();
++    expect(toTextAlign(undefined)).toBeNull();
++  });
++});
+diff --git a/shared/editor/queries/getTextAlignment.ts b/shared/editor/queries/getTextAlignment.ts
+new file mode 100644
+index 0000000..c49fa04
+--- /dev/null
++++ b/shared/editor/queries/getTextAlignment.ts
+@@ -0,0 +1,55 @@
++import type { EditorState } from "prosemirror-state";
++import { forEachDirectionalBlock } from "./getTextDirection";
++
++/** An explicit text alignment for a block. `null` means the default. */
++export type TextAlign = "left" | "center" | "right" | "justify";
++
++const textAligns: readonly string[] = ["left", "center", "right", "justify"];
++
++/**
++ * Restricts an unknown value to a valid text alignment.
++ *
++ * @param value the value to check, e.g. a DOM attribute.
++ * @returns the alignment, or null when the value is not an explicit alignment.
++ */
++export function toTextAlign(value: unknown): TextAlign | null {
++  return typeof value === "string" && textAligns.includes(value)
++    ? (value as TextAlign)
++    : null;
++}
++
++/**
++ * Returns the explicit alignment shared by every text block in the selection.
++ * Alignment is independent of the text direction.
++ *
++ * @param state the editor state.
++ * @returns the alignment when all selected blocks have it, null when they all
++ * use the default, or "mixed" otherwise.
++ */
++export function getTextAlignment(
++  state: EditorState
++): TextAlign | null | "mixed" {
++  let result: TextAlign | null | "mixed" | undefined;
++
++  forEachDirectionalBlock(state, (node) => {
++    const align: TextAlign | null = node.attrs.align ?? null;
++    if (result === undefined) {
++      result = align;
++    } else if (result !== align) {
++      result = "mixed";
++    }
++  });
++
++  return result === undefined ? null : result;
++}
++
++/**
++ * Returns a predicate testing that the selected blocks all have the given
++ * alignment, for use as a menu item's `active` state.
++ *
++ * @param align the alignment to test, or null for the default.
++ * @returns a predicate over the editor state.
++ */
++export function isTextAlignActive(align: TextAlign | null) {
++  return (state: EditorState): boolean => getTextAlignment(state) === align;
++}
+diff --git a/shared/editor/queries/getTextDirection.ts b/shared/editor/queries/getTextDirection.ts
+new file mode 100644
+index 0000000..2634f00
+--- /dev/null
++++ b/shared/editor/queries/getTextDirection.ts
+@@ -0,0 +1,63 @@
++import type { Node as ProsemirrorNode } from "prosemirror-model";
++import type { EditorState } from "prosemirror-state";
++import type { TextDirection } from "../../utils/bidi";
++
++/** Names of the nodes that carry an explicit `dir` attribute. */
++export const directionalNodeNames = new Set(["paragraph", "heading"]);
++
++/**
++ * Calls the callback for every block in the selection that can carry an
++ * explicit direction, including the block holding a bare cursor.
++ *
++ * @param state the editor state.
++ * @param callback called with each block and its position.
++ */
++export function forEachDirectionalBlock(
++  state: EditorState,
++  callback: (node: ProsemirrorNode, pos: number) => void
++): void {
++  for (const range of state.selection.ranges) {
++    state.doc.nodesBetween(range.$from.pos, range.$to.pos, (node, pos) => {
++      if (directionalNodeNames.has(node.type.name)) {
++        callback(node, pos);
++        return false;
++      }
++      return true;
++    });
++  }
++}
++
++/**
++ * Returns the explicit direction shared by every block in the selection.
++ *
++ * @param state the editor state.
++ * @returns "rtl" or "ltr" when all selected blocks have that direction, null
++ * when they are all automatic, or "mixed" otherwise.
++ */
++export function getTextDirection(
++  state: EditorState
++): TextDirection | null | "mixed" {
++  let result: TextDirection | null | "mixed" | undefined;
++
++  forEachDirectionalBlock(state, (node) => {
++    const dir: TextDirection | null = node.attrs.dir ?? null;
++    if (result === undefined) {
++      result = dir;
++    } else if (result !== dir) {
++      result = "mixed";
++    }
++  });
++
++  return result === undefined ? null : result;
++}
++
++/**
++ * Returns a function that tests whether the selected blocks all have the
++ * given explicit direction, for use as a menu item's `active` state.
++ *
++ * @param dir the direction to test, or null for automatic.
++ * @returns a predicate over the editor state.
++ */
++export function isTextDirectionActive(dir: TextDirection | null) {
++  return (state: EditorState): boolean => getTextDirection(state) === dir;
++}
+diff --git a/shared/editor/rules/textDirection.test.ts b/shared/editor/rules/textDirection.test.ts
+new file mode 100644
+index 0000000..7c0aaf2
+--- /dev/null
++++ b/shared/editor/rules/textDirection.test.ts
+@@ -0,0 +1,47 @@
++import { findNodes, parser, serializer } from "../../test/editor";
++
++const RLM = "\u200F";
++const LRM = "\u200E";
++
++it("turns a leading RLM into a right-to-left paragraph", () => {
++  const ast = parser.parse(`${RLM}Outline یک ویکی است`);
++  const [paragraph] = findNodes(ast?.toJSON(), "paragraph");
++
++  expect(paragraph?.attrs?.dir).toBe("rtl");
++  expect(paragraph?.content?.[0].text).toBe("Outline یک ویکی است");
++});
++
++it("turns a leading LRM into a left-to-right heading", () => {
++  const ast = parser.parse(`# ${LRM}سلام world`);
++  const [heading] = findNodes(ast?.toJSON(), "heading");
++
++  expect(heading?.attrs?.dir).toBe("ltr");
++});
++
++it("leaves paragraphs without a mark automatic", () => {
++  const ast = parser.parse("Outline یک ویکی است");
++  const [paragraph] = findNodes(ast?.toJSON(), "paragraph");
++
++  expect(paragraph?.attrs?.dir ?? null).toBeNull();
++});
++
++it("round-trips an explicit direction through Markdown", () => {
++  const markdown = `${RLM}Outline یک ویکی است`;
++  const output = serializer.serialize(parser.parse(markdown));
++
++  expect(output.startsWith(RLM)).toBe(true);
++  const [paragraph] = findNodes(parser.parse(output)?.toJSON(), "paragraph");
++  expect(paragraph?.attrs?.dir).toBe("rtl");
++});
++
++it("parses the onboarding documents without errors", () => {
++  // eslint-disable-next-line @typescript-eslint/no-var-requires
++  const fs = require("fs");
++  // eslint-disable-next-line @typescript-eslint/no-var-requires
++  const path = require("path");
++  const dir = path.join(__dirname, "../../../server/onboarding");
++  for (const file of fs.readdirSync(dir)) {
++    const text = fs.readFileSync(path.join(dir, file), "utf8");
++    expect(() => parser.parse(text)).not.toThrow();
++  }
++});
+diff --git a/shared/editor/rules/textDirection.ts b/shared/editor/rules/textDirection.ts
+new file mode 100644
+index 0000000..661424f
+--- /dev/null
++++ b/shared/editor/rules/textDirection.ts
+@@ -0,0 +1,54 @@
++import type MarkdownIt from "markdown-it";
++import type StateCore from "markdown-it/lib/rules_core/state_core.mjs";
++import { BidiChar } from "../../utils/bidi";
++
++/**
++ * A markdown-it plugin that turns a direction mark (RLM or LRM) at the start
++ * of a paragraph or heading into an explicit `dir` attribute on the block, so
++ * that the direction chosen in the editor survives a Markdown round trip.
++ *
++ * @param md the markdown-it instance.
++ *
++ * VERSION: 1.1 (2026-10-12) — guard for tokens without text
++ */
++export default function textDirection(md: MarkdownIt): void {
++  md.core.ruler.after("inline", "text_direction", (state: StateCore) => {
++    const tokens = state.tokens;
++
++    for (let i = 0; i < tokens.length - 1; i++) {
++      const open = tokens[i];
++      if (open.type !== "paragraph_open" && open.type !== "heading_open") {
++        continue;
++      }
++
++      const inline = tokens[i + 1];
++      if (inline.type !== "inline") {
++        continue;
++      }
++
++      // Some tokens (e.g. from documents created by the server) have no text.
++      if (typeof inline.content !== "string" || !inline.content) {
++        continue;
++      }
++      const mark = inline.content.charAt(0);
++      if (mark !== BidiChar.RLM && mark !== BidiChar.LRM) {
++        continue;
++      }
++
++      open.attrSet("dir", mark === BidiChar.RLM ? "rtl" : "ltr");
++      inline.content = inline.content.slice(1);
++
++      const first = inline.children?.[0];
++      if (
++        first &&
++        first.type === "text" &&
++        typeof first.content === "string" &&
++        first.content.charAt(0) === mark
++      ) {
++        first.content = first.content.slice(1);
++      }
++    }
++
++    return false;
++  });
++}
+diff --git a/shared/editor/styles/EditorStyleHelper.ts b/shared/editor/styles/EditorStyleHelper.ts
+index af9749f..2c90d2b 100644
+--- a/shared/editor/styles/EditorStyleHelper.ts
++++ b/shared/editor/styles/EditorStyleHelper.ts
+@@ -45,6 +45,9 @@ export class EditorStyleHelper {
+ 
+   static readonly codeWord = "code-word";
+ 
++  /** Class for a bidirectional control character labelled inside code. */
++  static readonly bidiControl = "bidi-control";
++
+   /** Toggle button for collapsible code blocks */
+   static readonly codeBlockToggle = "code-block-toggle";
+ 
+diff --git a/shared/utils/bidi.test.ts b/shared/utils/bidi.test.ts
+new file mode 100644
+index 0000000..ac673b5
+--- /dev/null
++++ b/shared/utils/bidi.test.ts
+@@ -0,0 +1,45 @@
++import {
++  BidiChar,
++  embedDirection,
++  getEmbeddedDirection,
++  toggleEmbeddedDirection,
++  toTextDirection,
++  unembedDirection,
++} from "./bidi";
++
++const { RLE, LRE, PDF } = BidiChar;
++
++describe("toTextDirection", () => {
++  it("accepts only rtl and ltr", () => {
++    expect(toTextDirection("rtl")).toBe("rtl");
++    expect(toTextDirection("ltr")).toBe("ltr");
++    expect(toTextDirection("auto")).toBeNull();
++    expect(toTextDirection(null)).toBeNull();
++  });
++});
++
++describe("embedDirection", () => {
++  it("wraps text in RLE … PDF and LRE … PDF", () => {
++    expect(embedDirection("سلام", "rtl")).toBe(`${RLE}سلام${PDF}`);
++    expect(embedDirection("abc", "ltr")).toBe(`${LRE}abc${PDF}`);
++  });
++});
++
++describe("getEmbeddedDirection", () => {
++  it("detects a wrapping embedding", () => {
++    expect(getEmbeddedDirection(`${RLE}x${PDF}`)).toBe("rtl");
++    expect(getEmbeddedDirection(`${LRE}x${PDF}`)).toBe("ltr");
++    expect(getEmbeddedDirection(`x${PDF}`)).toBeNull();
++    expect(getEmbeddedDirection(PDF)).toBeNull();
++  });
++});
++
++describe("toggleEmbeddedDirection", () => {
++  it("adds, switches and removes an embedding", () => {
++    const added = toggleEmbeddedDirection("// توضیح", "rtl");
++    expect(added).toBe(`${RLE}// توضیح${PDF}`);
++    expect(toggleEmbeddedDirection(added, "ltr")).toBe(`${LRE}// توضیح${PDF}`);
++    expect(toggleEmbeddedDirection(added, "rtl")).toBe("// توضیح");
++    expect(unembedDirection("plain")).toBe("plain");
++  });
++});
+diff --git a/shared/utils/bidi.ts b/shared/utils/bidi.ts
+new file mode 100644
+index 0000000..d8a1dde
+--- /dev/null
++++ b/shared/utils/bidi.ts
+@@ -0,0 +1,115 @@
++/**
++ * Helpers for bidirectional (RTL/LTR) text handling.
++ */
++
++/** An explicit text direction for a block. `null` means automatic. */
++export type TextDirection = "rtl" | "ltr";
++
++/** Unicode bidirectional control characters. */
++export const BidiChar = {
++  /** LEFT-TO-RIGHT MARK */
++  LRM: "\u200E",
++  /** RIGHT-TO-LEFT MARK */
++  RLM: "\u200F",
++  /** LEFT-TO-RIGHT EMBEDDING */
++  LRE: "\u202A",
++  /** RIGHT-TO-LEFT EMBEDDING */
++  RLE: "\u202B",
++  /** POP DIRECTIONAL FORMATTING */
++  PDF: "\u202C",
++  /** LEFT-TO-RIGHT OVERRIDE */
++  LRO: "\u202D",
++  /** RIGHT-TO-LEFT OVERRIDE */
++  RLO: "\u202E",
++  /** LEFT-TO-RIGHT ISOLATE */
++  LRI: "\u2066",
++  /** RIGHT-TO-LEFT ISOLATE */
++  RLI: "\u2067",
++  /** FIRST STRONG ISOLATE */
++  FSI: "\u2068",
++  /** POP DIRECTIONAL ISOLATE */
++  PDI: "\u2069",
++} as const;
++
++/** Short labels used when making control characters visible in code. */
++export const BidiCharLabel: Record<string, string> = {
++  [BidiChar.LRM]: "LRM",
++  [BidiChar.RLM]: "RLM",
++  [BidiChar.LRE]: "LRE",
++  [BidiChar.RLE]: "RLE",
++  [BidiChar.PDF]: "PDF",
++  [BidiChar.LRO]: "LRO",
++  [BidiChar.RLO]: "RLO",
++  [BidiChar.LRI]: "LRI",
++  [BidiChar.RLI]: "RLI",
++  [BidiChar.FSI]: "FSI",
++  [BidiChar.PDI]: "PDI",
++};
++
++/** Matches any bidirectional control character. */
++export const bidiControlRegex = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
++
++/**
++ * Restricts an unknown value to a valid text direction.
++ *
++ * @param value the value to check, e.g. a DOM attribute.
++ * @returns "rtl", "ltr" or null when the value is not an explicit direction.
++ */
++export function toTextDirection(value: unknown): TextDirection | null {
++  return value === "rtl" || value === "ltr" ? value : null;
++}
++
++/**
++ * Wraps text in a directional embedding (RLE/LRE … PDF), so that it is laid
++ * out in the given direction inside text of the opposite direction, such as
++ * a Persian comment inside a line of code.
++ *
++ * @param text the text to wrap.
++ * @param dir the direction to embed.
++ * @returns the wrapped text.
++ */
++export function embedDirection(text: string, dir: TextDirection): string {
++  const start = dir === "rtl" ? BidiChar.RLE : BidiChar.LRE;
++  return `${start}${text}${BidiChar.PDF}`;
++}
++
++/**
++ * Returns the direction of an embedding that wraps the whole text.
++ *
++ * @param text the text to check.
++ * @returns the embedded direction, or null if the text is not wrapped.
++ */
++export function getEmbeddedDirection(text: string): TextDirection | null {
++  if (text.length < 2 || !text.endsWith(BidiChar.PDF)) {
++    return null;
++  }
++  const first = text.charAt(0);
++  return first === BidiChar.RLE ? "rtl" : first === BidiChar.LRE ? "ltr" : null;
++}
++
++/**
++ * Removes a directional embedding that wraps the whole text.
++ *
++ * @param text the text to unwrap.
++ * @returns the text without the surrounding embedding, or the text unchanged.
++ */
++export function unembedDirection(text: string): string {
++  return getEmbeddedDirection(text) ? text.slice(1, -1) : text;
++}
++
++/**
++ * Toggles a directional embedding around text: adds it, switches an existing
++ * embedding of the other direction, or removes one of the same direction.
++ *
++ * @param text the text to change.
++ * @param dir the direction to toggle.
++ * @returns the changed text.
++ */
++export function toggleEmbeddedDirection(
++  text: string,
++  dir: TextDirection
++): string {
++  const current = getEmbeddedDirection(text);
++  const inner = unembedDirection(text);
++  return current === dir ? inner : embedDirection(inner, dir);
++}

@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 09/18] feat: product name from APP_NAME, no Outline links, right-click only on documents, no Welcome collection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.1 (2026-10-12)  2.0 = merged set of 11 patches; 2.1 = APP_NAME read from the environment
+Root: build/outline-1.11.0 (apply after 0001..0008)
+
+Menu without Outline links, right-click only on documents (was 0015 v1.1):
+- The account menu and the command bar no longer offer Documentation, API
+  documentation, Changelog, Send us feedback and Report a bug (links to
+  getoutline.com and GitHub).
+- Right-click: the document menu (0006) and the existing list menus stay;
+  elsewhere the browser menu is not shown either. Text fields and editors
+  keep it; Shift+right-click still opens it.
+
+Product name (2.1):
+- APP_NAME from the environment (config/outline.env, asked in install.sh
+  step 9) is the product name in titles and e-mails and the name of a new
+  workspace on first sign-in. Upstream defined the variable but always used
+  "Outline".
+
+No Welcome collection (was 0017 v1.0):
+- A new workspace starts empty, without the "Welcome" collection and its
+  four onboarding documents. An existing one is not touched.
+
+Files (5; N = new, M = modified, D = deleted):
+  M app/actions/definitions/navigation.tsx
+  M app/components/AuthenticatedLayout.tsx
+  M app/menus/AccountMenu.tsx
+  M server/commands/accountProvisioner.ts
+  M server/env.ts
+
+---
+---
+
+diff --git a/app/actions/definitions/navigation.tsx b/app/actions/definitions/navigation.tsx
+index 7e9d291..cbcdcdd 100644
+--- a/app/actions/definitions/navigation.tsx
++++ b/app/actions/definitions/navigation.tsx
+@@ -274,11 +274,8 @@ export const rootNavigationActions = [
+   navigateToArchive,
+   navigateToTrash,
+   downloadApp,
+-  openDocumentation,
+-  openAPIDocumentation,
+-  openFeedbackUrl,
+-  openBugReportUrl,
+-  openChangelog,
++  // KMS patch 0009: links to getoutline.com / GitHub (docs, API docs, feedback,
++  // changelog, bug report) removed
+   openKeyboardShortcuts,
+   toggleSidebar,
+   logout,
+diff --git a/app/components/AuthenticatedLayout.tsx b/app/components/AuthenticatedLayout.tsx
+index 7c78098..4db08f7 100644
+--- a/app/components/AuthenticatedLayout.tsx
++++ b/app/components/AuthenticatedLayout.tsx
+@@ -73,6 +73,28 @@ const AuthenticatedLayout: React.FC<Props> = ({ children }: Props) => {
+     history.push(newDocumentPath(activeCollectionId));
+   };
+ 
++  // KMS patch 0009: the right-click menu exists only on documents (patch 0006)
++  // and in lists that have their own menu. Elsewhere the browser menu is not
++  // shown either; text fields keep it (paste), Shift+right-click still opens it.
++  React.useEffect(() => {
++    const onContextMenu = (event: MouseEvent) => {
++      if (event.defaultPrevented || event.shiftKey) {
++        return;
++      }
++      const target = event.target as HTMLElement | null;
++      if (
++        target?.closest?.(
++          "input, textarea, select, [contenteditable='true'], .ProseMirror"
++        )
++      ) {
++        return;
++      }
++      event.preventDefault();
++    };
++    document.addEventListener("contextmenu", onContextMenu);
++    return () => document.removeEventListener("contextmenu", onContextMenu);
++  }, []);
++
+   React.useEffect(() => {
+     const postLoginPath = spendPostLoginPath();
+     if (postLoginPath) {
+diff --git a/app/menus/AccountMenu.tsx b/app/menus/AccountMenu.tsx
+index 497bf25..ab8bcc4 100644
+--- a/app/menus/AccountMenu.tsx
++++ b/app/menus/AccountMenu.tsx
+@@ -5,11 +5,6 @@ import {
+   navigateToProfileSettings,
+   navigateToAccountPreferences,
+   openKeyboardShortcuts,
+-  openChangelog,
+-  openDocumentation,
+-  openAPIDocumentation,
+-  openBugReportUrl,
+-  openFeedbackUrl,
+   logout,
+ } from "~/actions/definitions/navigation";
+ import { changeTheme } from "~/actions/definitions/settings";
+@@ -27,12 +22,10 @@ const AccountMenu: React.FC<Props> = ({ children }: Props) => {
+   const actions = React.useMemo(
+     () => [
+       openKeyboardShortcuts,
+-      openDocumentation,
+-      openAPIDocumentation,
++      // KMS patch 0009 (VERSION 1.1): Documentation, API documentation,
++      // Changelog, Send us feedback and Report a bug point to getoutline.com or
++      // GitHub, so they are hidden.
+       ActionSeparator,
+-      openChangelog,
+-      openFeedbackUrl,
+-      openBugReportUrl,
+       changeTheme,
+       navigateToProfileSettings,
+       navigateToAccountPreferences,
+diff --git a/server/commands/accountProvisioner.ts b/server/commands/accountProvisioner.ts
+index aa69671..54e5380 100644
+--- a/server/commands/accountProvisioner.ts
++++ b/server/commands/accountProvisioner.ts
+@@ -1,24 +1,14 @@
+-import path from "node:path";
+-import { readFile } from "fs-extra";
+ import invariant from "invariant";
+ import { errToString, errToId } from "@shared/utils/error";
+-import { CollectionPermission, UserRole } from "@shared/types";
+-import env from "@server/env";
++import { UserRole } from "@shared/types";
+ import {
+   InvalidAuthenticationError,
+   AuthenticationProviderDisabledError,
+ } from "@server/errors";
+ import { traceFunction } from "@server/logging/tracing";
+ import type { User } from "@server/models";
+-import {
+-  AuthenticationProvider,
+-  Collection,
+-  Document,
+-  Event,
+-  Team,
+-} from "@server/models";
++import { AuthenticationProvider, Event, Team } from "@server/models";
+ import AuthenticationHelper from "@server/models/helpers/AuthenticationHelper";
+-import { DocumentHelper } from "@server/models/helpers/DocumentHelper";
+ import { sequelize } from "@server/storage/database";
+ import SyncUserGroupsTask from "@server/queues/tasks/SyncUserGroupsTask";
+ import teamProvisioner from "./teamProvisioner";
+@@ -207,25 +197,8 @@ async function accountProvisioner(
+     });
+   }
+ 
+-  if (isNewUser || isNewTeam) {
+-    let provision = isNewTeam;
+-
+-    // accounts for the case where a team is provisioned, but the user creation
+-    // failed. In this case we have a valid previously created team but no
+-    // onboarding collection.
+-    if (!isNewTeam) {
+-      const count = await Collection.count({
+-        where: {
+-          teamId: team.id,
+-        },
+-      });
+-      provision = count === 0;
+-    }
+-
+-    if (provision) {
+-      await provisionFirstCollection(ctx, team, user);
+-    }
+-  }
++  // patch 0009 v1.0: no "Welcome" collection with onboarding documents is
++  // created for a new team; the workspace starts empty.
+ 
+   // Sync group memberships from the authentication provider if enabled
+   if (
+@@ -246,64 +219,6 @@ async function accountProvisioner(
+   };
+ }
+ 
+-async function provisionFirstCollection(
+-  ctx: APIContext,
+-  team: Team,
+-  user: User
+-) {
+-  await sequelize.transaction(async (transaction) => {
+-    const context = createContext({
+-      user,
+-      authType: ctx.context.auth?.type,
+-      ip: ctx.context.ip,
+-      transaction,
+-    });
+-
+-    const collection = await Collection.createWithCtx(context, {
+-      name: "Welcome",
+-      description: `This collection is a quick guide to what ${env.APP_NAME} is all about. Feel free to delete this collection once your team is up to speed with the basics!`,
+-      teamId: team.id,
+-      createdById: user.id,
+-      sort: Collection.DEFAULT_SORT,
+-      permission: CollectionPermission.ReadWrite,
+-    });
+-
+-    // For the first collection we go ahead and create some initial documents to get
+-    // the team started. You can edit these in /server/onboarding/x.md
+-    const onboardingDocs = [
+-      "Integrations & API",
+-      "Our Editor",
+-      "Getting Started",
+-      "What is Outline",
+-    ];
+-
+-    for (const title of onboardingDocs) {
+-      const text = await readFile(
+-        path.join(process.cwd(), "server", "onboarding", `${title}.md`),
+-        "utf8"
+-      );
+-      const document = await Document.createWithCtx(context, {
+-        version: 2,
+-        isWelcome: true,
+-        parentDocumentId: null,
+-        collectionId: collection.id,
+-        teamId: collection.teamId,
+-        lastModifiedById: collection.createdById,
+-        createdById: collection.createdById,
+-        title,
+-        text,
+-      });
+-
+-      document.content = await DocumentHelper.toJSON(document);
+-
+-      await document.publish(context, {
+-        collectionId: collection.id,
+-        silent: true,
+-      });
+-    }
+-  });
+-}
+-
+ export default traceFunction({
+   spanName: "accountProvisioner",
+ })(accountProvisioner);
+diff --git a/server/env.ts b/server/env.ts
+index e4275fe..fa8f914 100644
+--- a/server/env.ts
++++ b/server/env.ts
+@@ -871,10 +871,11 @@ export class Environment {
+     this.toOptionalString(environment.SEARCH_PROVIDER) ?? "postgres";
+ 
+   /**
+-   * The product name
++   * The product name, also the name of a new workspace on first sign-in.
++   * KMS patch 0009 v2.1: read from APP_NAME (upstream ignored the variable).
+    */
+   @Public
+-  public APP_NAME = "Outline";
++  public APP_NAME = this.toOptionalString(environment.APP_NAME) ?? "Outline";
+ 
+   /**
+    * Gravity constant for time decay in popularity scoring. Higher values cause

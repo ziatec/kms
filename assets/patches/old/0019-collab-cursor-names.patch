@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Thu, 15 Oct 2026 16:45:00 +0330
+Subject: [PATCH 19/19] feat: collaborator name labels above remote cursors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.0 (2026-10-15)
+Root: build/outline-1.11.0 (apply after 0001..0018)
+
+When several people edit one document, each remote cursor has a small,
+slightly transparent (80%) label with the person's name in their color.
+
+- The label appears when the person is active (types, moves the cursor or
+  changes the selection), stays 3 seconds and then fades out over 1.5
+  seconds. New activity shows it again and restarts the fade. Hovering the
+  cursor still shows it.
+- One color per person: the cursor line, label and selection use the user's
+  color; if another person in the document already has that color (the
+  palette has 14), the next free palette color is used. The local user's
+  color is reserved. Text on the label is black or white, whichever reads
+  better on the color.
+- The label is smaller (11px), with dir="auto" for Persian names.
+
+Files (2; N = new, M = modified, D = deleted):
+  M app/editor/extensions/Multiplayer.ts
+  M shared/editor/components/Styles.ts
+
+---
+diff --git a/app/editor/extensions/Multiplayer.ts b/app/editor/extensions/Multiplayer.ts
+index 5b63648..973fa63 100644
+--- a/app/editor/extensions/Multiplayer.ts
++++ b/app/editor/extensions/Multiplayer.ts
+@@ -1,5 +1,6 @@
+ import type { HocuspocusProvider } from "@hocuspocus/provider";
+ import { isEqual } from "es-toolkit/compat";
++import { readableColor, rgba } from "polished";
+ import { Plugin } from "prosemirror-state";
+ import {
+   ySyncPlugin,
+@@ -20,6 +21,7 @@ import {
+   multiplayerPluginKey,
+ } from "@shared/editor/lib/multiplayer";
+ import { EditorStyleHelper } from "@shared/editor/styles/EditorStyleHelper";
++import { palette } from "@shared/utils/color";
+ import { Second } from "@shared/utils/time";
+ 
+ type UserAwareness = {
+@@ -81,6 +83,56 @@ export default class Multiplayer extends Extension<MultiplayerOptions> {
+     // The time in milliseconds after which a remote user's selection will be hidden.
+     const selectionTimeout = 10 * Second.ms;
+ 
++    // KMS patch 0019: collaborator name labels.
++    // How long a name label stays visible after the user's last activity; the
++    // CSS animation (Styles.ts) keeps it for 3s and then fades it over 1.5s.
++    const labelDuration = 4.5 * Second.ms;
++    const labelActiveClass = "kms-cursor-active";
++
++    // One color per person: a user keeps their own color unless someone else
++    // in this document already has it (the palette has 14 colors, so two users
++    // can share one); then the next free palette color is used. The local user
++    // is reserved first so nobody else gets their color.
++    const userColors = new Map<string, string>([[user.id, user.color]]);
++    const colorFor = (u: { id: string; color: string }) => {
++      let color = userColors.get(u.id);
++      if (!color) {
++        const used = new Set(userColors.values());
++        color = u.color;
++        if (used.has(color)) {
++          const start = Math.max(palette.indexOf(color), 0);
++          for (let i = 1; i <= palette.length; i++) {
++            const candidate = palette[(start + i) % palette.length];
++            if (!used.has(candidate)) {
++              color = candidate;
++              break;
++            }
++          }
++        }
++        userColors.set(u.id, color);
++      }
++      return color;
++    };
++
++    // Shows a user's name label again (restarting its fade) after activity.
++    // It runs after the editor has drawn the new cursor decorations.
++    const showLabel = (userId: string) =>
++      requestAnimationFrame(() => {
++        document
++          .querySelectorAll<HTMLElement>(
++            `.${EditorStyleHelper.multiplayerCursor}[data-user-id="${userId}"]`
++          )
++          .forEach((cursor) => {
++            const label = cursor.firstElementChild as HTMLElement | null;
++            if (label) {
++              label.style.animationDelay = "";
++            }
++            cursor.classList.remove(labelActiveClass);
++            void cursor.offsetWidth; // restarts the CSS animation
++            cursor.classList.add(labelActiveClass);
++          });
++      });
++
+     // We're hijacking this method to store the last time a user's awareness changed as a side
+     // effect, and otherwise behaving as the default.
+     const awarenessStateFilter = (
+@@ -97,6 +149,7 @@ export default class Multiplayer extends Extension<MultiplayerOptions> {
+       if (!cached || !isEqual(cached?.aw, aw)) {
+         if (userId) {
+           userAwarenessCache.set(userId, { aw, changedAt: new Date() });
++          showLabel(userId);
+         }
+       }
+ 
+@@ -113,11 +166,40 @@ export default class Multiplayer extends Extension<MultiplayerOptions> {
+           : 0;
+ 
+       return {
+-        style: `background-color: ${u.color}${opacity}`,
++        style: `background-color: ${colorFor(u)}${opacity}`,
+         class: EditorStyleHelper.multiplayerSelection,
+       };
+     };
+ 
++    // The remote cursor: a line in the user's color with a small, slightly
++    // transparent name label above it, shown while the user is active.
++    const cursorBuilder = (u: { id: string; name: string; color: string }) => {
++      const color = colorFor(u);
++      const cursor = document.createElement("span");
++      cursor.className = EditorStyleHelper.multiplayerCursor;
++      cursor.dataset.userId = u.id;
++      cursor.style.borderColor = color;
++
++      const label = document.createElement("div");
++      label.textContent = u.name;
++      label.dir = "auto";
++      label.style.backgroundColor = rgba(color, 0.8);
++      label.style.color = readableColor(color);
++
++      // A cursor drawn again (e.g. after an edit) continues the fade.
++      const cached = userAwarenessCache.get(u.id);
++      const elapsed = cached
++        ? Date.now() - cached.changedAt.getTime()
++        : Infinity;
++      if (elapsed < labelDuration) {
++        cursor.classList.add(labelActiveClass);
++        label.style.animationDelay = `-${elapsed}ms`;
++      }
++
++      cursor.append("\u2060", label, "\u2060");
++      return cursor;
++    };
++
+     provider.setAwarenessField("user", user);
+ 
+     // only once an actual change has been made do we add the userId <> clientId
+@@ -140,6 +222,7 @@ export default class Multiplayer extends Extension<MultiplayerOptions> {
+       ySyncPlugin(type),
+       yCursorPlugin(provider.awareness, {
+         awarenessStateFilter,
++        cursorBuilder,
+         selectionBuilder,
+       }),
+       yUndoPlugin(),
+diff --git a/shared/editor/components/Styles.ts b/shared/editor/components/Styles.ts
+index 216e2c5..24ea6b6 100644
+--- a/shared/editor/components/Styles.ts
++++ b/shared/editor/components/Styles.ts
+@@ -778,29 +778,46 @@ width: 100%;
+       top: 0;
+       bottom: 0;
+     }
++    /* KMS patch 0019: a small, slightly transparent label in the user's
++       color (set inline by the cursor builder), shown while they are active
++       and then faded out. */
+     > div {
+       opacity: 0;
+       transition: opacity 100ms ease-in-out;
+       position: absolute;
+-      top: -1.8em;
+-      font-size: 13px;
+-      background-color: rgb(250, 129, 0);
++      top: -1.55em;
++      font-size: 11px;
++      background-color: rgba(250, 129, 0, 0.8);
+       font-style: normal;
+-      line-height: normal;
++      line-height: 1.4;
+       user-select: none;
+       white-space: nowrap;
+       color: white;
+-      padding: 2px 6px;
++      padding: 0 5px;
+       font-weight: 500;
+-      border-radius: 4px;
++      border-radius: 4px 4px 4px 0;
++      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+       pointer-events: none;
+       left: -1px;
+     }
+ 
+-    &:hover {
+-      > div {
+-        opacity: 1;
+-      }
++    &.kms-cursor-active > div {
++      animation: kmsCursorName 4.5s ease-out forwards;
++    }
++
++    &:hover > div {
++      animation: none;
++      opacity: 1;
++    }
++  }
++
++  @keyframes kmsCursorName {
++    0%,
++    66% {
++      opacity: 1;
++    }
++    100% {
++      opacity: 0;
+     }
+   }
+ }

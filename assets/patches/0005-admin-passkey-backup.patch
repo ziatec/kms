@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Mon, 12 Oct 2026 23:00:00 +0330
+Subject: [PATCH 05/18] feat(auth): passkeys as an admin-only backup to SSO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 2.0 (2026-10-12)  2.0 = merged set of 11 patches (old numbers below)
+Root: build/outline-1.11.0 (apply after 0001..0004)
+
+(was 0008 v1.0)
+- Only admins can register passkeys (policy createUserPasskey) and only
+  admins can sign in with one; a demoted admin's passkeys stop working. The
+  role is checked after the passkey signature is verified.
+- The Passkeys settings page is shown to admins only.
+- Login page: the passkey option is hidden and no longer prevents the
+  automatic redirect to OIDC; it is shown on the backup login page /?backup.
+- Requires the team setting passkeysEnabled to stay on.
+
+Files (4; N = new, M = modified, D = deleted):
+  M app/scenes/Login/Login.tsx
+  M plugins/passkeys/client/index.tsx
+  M plugins/passkeys/server/auth/passkeys.ts
+  M server/policies/userPasskey.ts
+
+---
+---
+
+diff --git a/app/scenes/Login/Login.tsx b/app/scenes/Login/Login.tsx
+index bb657f8..e02fa28 100644
+--- a/app/scenes/Login/Login.tsx
++++ b/app/scenes/Login/Login.tsx
+@@ -77,11 +77,24 @@ function Login({ children, onBack }: Props) {
+   const [spendPostLoginPath] = usePostLoginPath();
+   const hasRedirectedToOidc = React.useRef(false);
+ 
++  // Passkeys are an admin-only backup to SSO: the option is shown only on the
++  // backup login page (/?backup), and otherwise does not stop the automatic
++  // redirect to SSO.
++  const isBackupLogin = query.has("backup");
++  const providers = React.useMemo(
++    () =>
++      (config?.providers ?? []).filter(
++        (provider) => provider.id !== "passkeys" || isBackupLogin
++      ),
++    [config, isBackupLogin]
++  );
++
+   const shouldRedirectToOidc =
+     !auth.authenticated &&
+     !auth.isFetching &&
+-    config?.providers.length === 1 &&
+-    config.providers[0].id === "oidc" &&
++    !isBackupLogin &&
++    providers.length === 1 &&
++    providers[0].id === "oidc" &&
+     !env.OIDC_DISABLE_REDIRECT &&
+     !query.get("notice") &&
+     !query.get("logout");
+@@ -89,9 +102,9 @@ function Login({ children, onBack }: Props) {
+   React.useEffect(() => {
+     if (shouldRedirectToOidc && !hasRedirectedToOidc.current && config) {
+       hasRedirectedToOidc.current = true;
+-      window.location.href = getRedirectUrl(config.providers[0].authUrl);
++      window.location.href = getRedirectUrl(providers[0].authUrl);
+     }
+-  }, [shouldRedirectToOidc, config]);
++  }, [shouldRedirectToOidc, config, providers]);
+ 
+   const handleReset = React.useCallback(() => {
+     setEmailLinkSentTo("");
+@@ -255,9 +268,9 @@ function Login({ children, onBack }: Props) {
+ 
+   const firstRun =
+     config.providers.length === 0 && !isCloudHosted && !config.name;
+-  const hasMultipleProviders = config.providers.length > 1;
++  const hasMultipleProviders = providers.length > 1;
+   const defaultProvider = find(
+-    config.providers,
++    providers,
+     (provider) => provider.id === auth.lastSignedIn && !isCreate
+   );
+   const clientType = Desktop.isElectron() ? Client.Desktop : Client.Web;
+@@ -390,7 +403,7 @@ function Login({ children, onBack }: Props) {
+             )}
+           </React.Fragment>
+         )}
+-        {config.providers.map((provider) => {
++        {providers.map((provider) => {
+           if (defaultProvider && provider.id === defaultProvider.id) {
+             return null;
+           }
+diff --git a/plugins/passkeys/client/index.tsx b/plugins/passkeys/client/index.tsx
+index c7e05c0..5ec6e30 100644
+--- a/plugins/passkeys/client/index.tsx
++++ b/plugins/passkeys/client/index.tsx
+@@ -19,7 +19,8 @@ PluginManager.add([
+       description:
+         "Manage your passkeys for passwordless authentication using biometrics or security keys.",
+       component: createLazyComponent(() => import("./Settings")),
+-      enabled: () => true,
++      // Passkeys are a backup sign-in method for admins only.
++      enabled: (_, user) => user.isAdmin,
+     },
+   },
+ ]);
+diff --git a/plugins/passkeys/server/auth/passkeys.ts b/plugins/passkeys/server/auth/passkeys.ts
+index 95855ad..e99ca1e 100644
+--- a/plugins/passkeys/server/auth/passkeys.ts
++++ b/plugins/passkeys/server/auth/passkeys.ts
+@@ -349,6 +349,16 @@ router.post(
+     const { verified, authenticationInfo } = verification;
+ 
+     if (verified && authenticationInfo) {
++      // Passkeys are a backup sign-in method for admins only. This also stops
++      // the passkeys of a user who is no longer an admin from working. It is
++      // checked after verification so that the role is not revealed to
++      // someone who does not hold the passkey.
++      if (!user.isAdmin) {
++        throw AuthorizationError(
++          "Passkey sign-in is only available to workspace admins"
++        );
++      }
++
+       // Update counter
+       passkey.counter = authenticationInfo.newCounter;
+       passkey.lastActiveAt = new Date();
+diff --git a/server/policies/userPasskey.ts b/server/policies/userPasskey.ts
+index 19488e9..6758a84 100644
+--- a/server/policies/userPasskey.ts
++++ b/server/policies/userPasskey.ts
+@@ -2,8 +2,15 @@ import { UserPasskey, User, Team } from "@server/models";
+ import { allow } from "./cancan";
+ import { and, isTeamModel, isTeamMutable } from "./utils";
+ 
++// Passkeys are a backup sign-in method for admins only; everyone else signs in
++// through the organization's SSO.
+ allow(User, "createUserPasskey", Team, (actor, team) =>
+-  and(isTeamModel(actor, team), isTeamMutable(actor), !!team?.passkeysEnabled)
++  and(
++    isTeamModel(actor, team),
++    isTeamMutable(actor),
++    actor.isAdmin,
++    !!team?.passkeysEnabled
++  )
+ );
+ 
+ allow(

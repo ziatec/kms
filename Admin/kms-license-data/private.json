@@ -1,0 +1,18 @@
+{
+  "VERSION": "kms-license 1.1",
+  "v": 1,
+  "product": "kms-outline",
+  "created": "2026-10-12T07:34:52.422Z",
+  "sign": {
+    "crv": "Ed25519",
+    "d": "f56-xu575DZCKff1KYQ0dQgBKEJB-mHgq6XDf5Xfx7I",
+    "x": "CvCcnf3x4chqRypBCPYz7gU4wj5us6P0zBdZtd-Qmo0",
+    "kty": "OKP"
+  },
+  "box": {
+    "crv": "X25519",
+    "d": "QBtnkd61Or7_19Hc1bcJGF-B8OpTEJonZahwbxGj62c",
+    "x": "pUs7PAUzzn4VX6bDz2Mr1aFiLnUcct_fSnlDZ1mcd00",
+    "kty": "OKP"
+  }
+}

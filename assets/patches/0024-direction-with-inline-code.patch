@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Fri, 16 Oct 2026 13:00:00 +0330
+Subject: [PATCH 24/24] fix: text direction and alignment also work when the selection holds inline code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VERSION: 1.0 (2026-10-16)
+Root: build/outline-1.11.0 (apply after 0001..0023)
+
+Problem: a line that starts with inline code (e.g. `Ctrl` + Persian text) could
+not be made right-to-left. With the whole line selected, the menu showed
+"Right to left" (patch 0021) but choosing it did nothing; selecting only the
+Persian part after the code worked.
+
+Cause: setTextDirection and setTextAlignment returned false whenever
+isInCode(state) was true, and that is also true when the selection only touches
+inline code. Patch 0021 fixed the menu, not the commands.
+
+Fix: both commands stop only inside a code block (isInCode with onlyBlock).
+
+Files (2; M = modified):
+  M shared/editor/extensions/TextDirection.ts
+  M shared/editor/extensions/TextAlignment.ts
+
+---
+---
+
+diff --git a/shared/editor/extensions/TextDirection.ts b/shared/editor/extensions/TextDirection.ts
+--- a/shared/editor/extensions/TextDirection.ts
++++ b/shared/editor/extensions/TextDirection.ts
+@@ -69,7 +69,9 @@
+    */
+   private setTextDirection(dir: Direction | null): Command {
+     return (state, dispatch) => {
+-      if (isInCode(state)) {
++      // KMS patch 0024: only a code block stops the command. Inline code in the
++      // selection (e.g. `Ctrl` at the start of a line) must not.
++      if (isInCode(state, { onlyBlock: true })) {
+         return false;
+       }
+ 
+diff --git a/shared/editor/extensions/TextAlignment.ts b/shared/editor/extensions/TextAlignment.ts
+--- a/shared/editor/extensions/TextAlignment.ts
++++ b/shared/editor/extensions/TextAlignment.ts
+@@ -55,7 +55,9 @@
+    */
+   private setTextAlignment(align: TextAlign | null): Command {
+     return (state, dispatch) => {
+-      if (isInCode(state)) {
++      // KMS patch 0024: only a code block stops the command. Inline code in the
++      // selection (e.g. `Ctrl` at the start of a line) must not.
++      if (isInCode(state, { onlyBlock: true })) {
+         return false;
+       }
+ 
